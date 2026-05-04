@@ -604,7 +604,10 @@ fn main() {
     config.define("LLAMA_BUILD_TESTS", "OFF");
     config.define("LLAMA_BUILD_EXAMPLES", "OFF");
     config.define("LLAMA_BUILD_SERVER", "OFF");
-    config.define("LLAMA_BUILD_TOOLS", "OFF");
+    config.define(
+        "LLAMA_BUILD_TOOLS",
+        if cfg!(feature = "mtmd") { "ON" } else { "OFF" },
+    );
     // `app` (the unified `llama` binary) defaults to ON when llama.cpp is the
     // top-level CMake project; it pulls in server/tool internals we don't build.
     config.define("LLAMA_BUILD_APP", "OFF");
@@ -711,6 +714,15 @@ fn main() {
 
     if matches!(target_os, TargetOs::Apple(_)) {
         config.define("GGML_BLAS", "OFF");
+
+        if let Ok(deployment_target) = env::var("CMAKE_OSX_DEPLOYMENT_TARGET")
+            .or_else(|_| env::var("MACOSX_DEPLOYMENT_TARGET"))
+        {
+            config.define("CMAKE_OSX_DEPLOYMENT_TARGET", &deployment_target);
+            config.define("GGML_METAL_MACOSX_VERSION_MIN", &deployment_target);
+            config.cflag(format!("-mmacosx-version-min={deployment_target}"));
+            config.cxxflag(format!("-mmacosx-version-min={deployment_target}"));
+        }
     }
 
     // watchOS has no Metal framework, so disable the Metal backend there.
@@ -985,51 +997,57 @@ fn main() {
         println!("cargo:backends_dir={}", out_dir.join("backends").display());
     }
 
-    // Build mtmd directly with cc::Build, bypassing the cmake tools build.
-    // Using LLAMA_BUILD_TOOLS=ON would pull in all tools (batched-bench, quantize, etc.)
-    // and their CMakeLists.txt files, which are not included in the crate package.
-    if cfg!(feature = "mtmd") {
-        let mtmd_src = llama_src.join("tools/mtmd");
-        let mut mtmd_build = cc::Build::new();
-        mtmd_build
-            .cpp(true)
-            .include(&mtmd_src)
-            .include(&llama_src)
-            .include(llama_src.join("include"))
-            .include(llama_src.join("ggml/include"))
-            .include(llama_src.join("common"))
-            .include(llama_src.join("vendor"))
-            .flag_if_supported("-std=c++17")
-            .flag_if_supported("-Wno-cast-qual")
-            .pic(true);
-
-        if matches!(target_os, TargetOs::Windows(WindowsVariant::Msvc)) {
-            mtmd_build.flag("/std:c++17");
-        }
-
-        // When static-stdcxx is enabled on Android, suppress the cc crate's automatic
-        // C++ stdlib linking (which defaults to c++_shared) so we can link c++_static instead.
-        if matches!(target_os, TargetOs::Android) && cfg!(feature = "static-stdcxx") {
-            mtmd_build.cpp_link_stdlib(None);
-        }
-
-        // Collect all .cpp files in tools/mtmd and its subdirectories
-        for entry in glob(mtmd_src.join("**/*.cpp").to_str().unwrap()).unwrap() {
-            match entry {
-                Ok(path) => {
-                    // Skip CLI / deprecation-warning binaries — we only want the library sources
-                    let filename = path.file_name().unwrap().to_str().unwrap();
-                    if filename == "mtmd-cli.cpp" || filename == "deprecation-warning.cpp" {
-                        continue;
-                    }
-                    mtmd_build.file(&path);
-                }
-                Err(e) => println!("cargo:warning=mtmd glob error: {}", e),
-            }
-        }
-
-        mtmd_build.compile("mtmd");
-    }
+    // Historical reference: before switching to the upstream CMake tools build for MTMD,
+    // this crate built `tools/mtmd` directly via `cc::Build`.
+    //
+    // We intentionally keep the old approach here as commented-out reference because it may still
+    // be useful if we later want to experiment with a narrower "build only libmtmd" path instead
+    // of enabling the broader upstream tools build.
+    //
+    // if cfg!(feature = "mtmd") {
+    //     let mtmd_src = llama_src.join("tools/mtmd");
+    //     let mut mtmd_build = cc::Build::new();
+    //     mtmd_build
+    //         .cpp(true)
+    //         .include(&mtmd_src)
+    //         .include(&llama_src)
+    //         .include(llama_src.join("include"))
+    //         .include(llama_src.join("ggml/include"))
+    //         .include(llama_src.join("common"))
+    //         .include(llama_src.join("vendor"))
+    //         .flag_if_supported("-std=c++17")
+    //         .flag_if_supported("-Wno-cast-qual")
+    //         .pic(true);
+    //
+    //     if matches!(target_os, TargetOs::Windows(WindowsVariant::Msvc)) {
+    //         mtmd_build.flag("/std:c++17");
+    //     }
+    //
+    //     // When static-stdcxx is enabled on Android, suppress the cc crate's automatic
+    //     // C++ stdlib linking (which defaults to c++_shared) so we can link c++_static
+    //     // instead.
+    //     if matches!(target_os, TargetOs::Android) && cfg!(feature = "static-stdcxx") {
+    //         mtmd_build.cpp_link_stdlib(None);
+    //     }
+    //
+    //     // Collect all .cpp files in tools/mtmd and its subdirectories.
+    //     for entry in glob(mtmd_src.join("**/*.cpp").to_str().unwrap()).unwrap() {
+    //         match entry {
+    //             Ok(path) => {
+    //                 // Skip CLI / deprecation-warning binaries — we only want the library
+    //                 // sources.
+    //                 let filename = path.file_name().unwrap().to_str().unwrap();
+    //                 if filename == "mtmd-cli.cpp" || filename == "deprecation-warning.cpp" {
+    //                     continue;
+    //                 }
+    //                 mtmd_build.file(&path);
+    //             }
+    //             Err(err) => println!("cargo:warning=mtmd glob error: {}", err),
+    //         }
+    //     }
+    //
+    //     mtmd_build.compile("mtmd");
+    // }
 
     // Search paths
     println!("cargo:rustc-link-search={}", out_dir.join("lib").display());
@@ -1173,9 +1191,14 @@ fn main() {
         "static"
     };
 
-    let llama_libs = extract_lib_names(&out_dir, build_shared_libs, &target_os);
+    let mut llama_libs = extract_lib_names(&out_dir, build_shared_libs, &target_os);
 
     assert_ne!(llama_libs.len(), 0);
+
+    if cfg!(feature = "mtmd") {
+        llama_libs.retain(|lib| lib != "mtmd");
+        println!("cargo:rustc-link-lib={llama_libs_kind}=mtmd");
+    }
 
     let common_lib_dir = out_dir.join("build").join("common");
     if cfg!(feature = "common") && common_lib_dir.is_dir() {
