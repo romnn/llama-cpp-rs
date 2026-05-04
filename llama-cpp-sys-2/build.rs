@@ -630,7 +630,10 @@ fn main() {
     config.define("LLAMA_BUILD_TESTS", "OFF");
     config.define("LLAMA_BUILD_EXAMPLES", "OFF");
     config.define("LLAMA_BUILD_SERVER", "OFF");
-    config.define("LLAMA_BUILD_TOOLS", "OFF");
+    config.define(
+        "LLAMA_BUILD_TOOLS",
+        if cfg!(feature = "mtmd") { "ON" } else { "OFF" },
+    );
     // `app` (the unified `llama` binary) defaults to ON when llama.cpp is the
     // top-level CMake project; it pulls in server/tool internals we don't build.
     config.define("LLAMA_BUILD_APP", "OFF");
@@ -753,6 +756,15 @@ fn main() {
 
     if matches!(target_os, TargetOs::Apple(_)) {
         config.define("GGML_BLAS", "OFF");
+
+        if let Ok(deployment_target) = env::var("CMAKE_OSX_DEPLOYMENT_TARGET")
+            .or_else(|_| env::var("MACOSX_DEPLOYMENT_TARGET"))
+        {
+            config.define("CMAKE_OSX_DEPLOYMENT_TARGET", &deployment_target);
+            config.define("GGML_METAL_MACOSX_VERSION_MIN", &deployment_target);
+            config.cflag(format!("-mmacosx-version-min={deployment_target}"));
+            config.cxxflag(format!("-mmacosx-version-min={deployment_target}"));
+        }
     }
 
     // watchOS has no Metal framework, so disable the Metal backend there.
@@ -1257,9 +1269,14 @@ fn main() {
         "static"
     };
 
-    let llama_libs = extract_lib_names(&out_dir.join("lib*"), &target_os, build_shared_libs);
+    let mut llama_libs = extract_lib_names(&out_dir.join("lib*"), &target_os, build_shared_libs);
 
     assert_ne!(llama_libs.len(), 0);
+
+    if cfg!(feature = "mtmd") {
+        llama_libs.retain(|lib| lib != "mtmd");
+        println!("cargo:rustc-link-lib={llama_libs_kind}=mtmd");
+    }
 
     let common_lib_dir = out_dir.join("build").join("common");
     if cfg!(feature = "common") && common_lib_dir.is_dir() {
