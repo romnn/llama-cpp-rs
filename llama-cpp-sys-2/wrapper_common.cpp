@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <vector>
 
+#include "llama.cpp/common/chat.h"
 #include "llama.cpp/common/common.h"
 #include "llama.cpp/common/fit.h"
 #include "llama.cpp/common/json-schema-to-grammar.h"
@@ -32,6 +33,42 @@ extern "C" llama_rs_status llama_rs_json_schema_to_grammar(
         *out_grammar = llama_rs_dup_string(grammar);
         return *out_grammar ? LLAMA_RS_STATUS_OK : LLAMA_RS_STATUS_ALLOCATION_FAILED;
     } catch (const std::exception &) {
+        return LLAMA_RS_STATUS_EXCEPTION;
+    } catch (...) {
+        return LLAMA_RS_STATUS_EXCEPTION;
+    }
+}
+
+extern "C" llama_rs_status llama_rs_chat_template_get_caps(
+    const struct llama_model * model,
+    const char * chat_template,
+    struct llama_rs_chat_template_caps * out_caps) {
+    if (!model || !chat_template || !out_caps) {
+        return LLAMA_RS_STATUS_INVALID_ARGUMENT;
+    }
+
+    *out_caps = {};
+    try {
+        auto tmpls = common_chat_templates_init(model, chat_template);
+        const auto caps = common_chat_templates_get_caps(tmpls.get());
+
+        const auto read_cap = [&](const char * key) {
+            const auto it = caps.find(key);
+            return it != caps.end() ? it->second : false;
+        };
+
+        out_caps->supports_tools = read_cap("supports_tools");
+        out_caps->supports_tool_calls = read_cap("supports_tool_calls");
+        out_caps->supports_system_role = read_cap("supports_system_role");
+        out_caps->supports_parallel_tool_calls = read_cap("supports_parallel_tool_calls");
+        out_caps->supports_preserve_reasoning = read_cap("supports_preserve_reasoning");
+        out_caps->supports_string_content = read_cap("supports_string_content");
+        out_caps->supports_typed_content = read_cap("supports_typed_content");
+        out_caps->supports_object_arguments = read_cap("supports_object_arguments");
+        return LLAMA_RS_STATUS_OK;
+    } catch (const std::exception &) {
+        return LLAMA_RS_STATUS_EXCEPTION;
+    } catch (...) {
         return LLAMA_RS_STATUS_EXCEPTION;
     }
 }

@@ -10,6 +10,38 @@ struct llama_sampler;
 struct llama_rs_mtp_speculative;
 struct llama_vocab;
 
+struct llama_rs_grammar_trigger {
+    int type;
+    char * value;
+    llama_token token;
+};
+
+struct llama_rs_chat_template_result {
+    char * prompt;
+    char * grammar;
+    char * parser;
+    char * generation_prompt;
+    int chat_format;
+    bool grammar_lazy;
+    struct llama_rs_grammar_trigger * grammar_triggers;
+    size_t grammar_triggers_count;
+    char ** preserved_tokens;
+    size_t preserved_tokens_count;
+    char ** additional_stops;
+    size_t additional_stops_count;
+};
+
+struct llama_rs_chat_template_caps {
+    bool supports_tools;
+    bool supports_tool_calls;
+    bool supports_system_role;
+    bool supports_parallel_tool_calls;
+    bool supports_preserve_reasoning;
+    bool supports_string_content;
+    bool supports_typed_content;
+    bool supports_object_arguments;
+};
+
 #include "wrapper_utils.h"
 
 #ifdef __cplusplus
@@ -20,6 +52,11 @@ llama_rs_status llama_rs_json_schema_to_grammar(
     const char * schema_json,
     bool force_gbnf,
     char ** out_grammar);
+
+llama_rs_status llama_rs_chat_template_get_caps(
+    const struct llama_model * model,
+    const char * chat_template,
+    struct llama_rs_chat_template_caps * out_caps);
 
 struct llama_sampler * llama_rs_sampler_init_grammar(
     const struct llama_vocab * vocab,
