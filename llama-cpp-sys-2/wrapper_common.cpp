@@ -73,6 +73,72 @@ extern "C" llama_rs_status llama_rs_chat_template_get_caps(
     }
 }
 
+extern "C" void llama_rs_backend_load_all(void) {
+    ggml_backend_load_all();
+}
+
+extern "C" llama_rs_status llama_rs_backend_load_all_from_path(const char * dir_path) {
+    if (!dir_path) {
+        return LLAMA_RS_STATUS_INVALID_ARGUMENT;
+    }
+    try {
+        ggml_backend_load_all_from_path(dir_path);
+        return LLAMA_RS_STATUS_OK;
+    } catch (const std::exception &) {
+        return LLAMA_RS_STATUS_EXCEPTION;
+    } catch (...) {
+        return LLAMA_RS_STATUS_EXCEPTION;
+    }
+}
+
+extern "C" void llama_rs_chat_template_result_free(struct llama_rs_chat_template_result * result) {
+    if (!result) {
+        return;
+    }
+    if (result->prompt) {
+        std::free(result->prompt);
+    }
+    if (result->grammar) {
+        std::free(result->grammar);
+    }
+    if (result->parser) {
+        std::free(result->parser);
+    }
+    if (result->generation_prompt) {
+        std::free(result->generation_prompt);
+    }
+    if (result->grammar_triggers) {
+        for (size_t i = 0; i < result->grammar_triggers_count; ++i) {
+            std::free(result->grammar_triggers[i].value);
+        }
+        std::free(result->grammar_triggers);
+    }
+    if (result->preserved_tokens) {
+        for (size_t i = 0; i < result->preserved_tokens_count; ++i) {
+            std::free(result->preserved_tokens[i]);
+        }
+        std::free(result->preserved_tokens);
+    }
+    if (result->additional_stops) {
+        for (size_t i = 0; i < result->additional_stops_count; ++i) {
+            std::free(result->additional_stops[i]);
+        }
+        std::free(result->additional_stops);
+    }
+    result->prompt = nullptr;
+    result->grammar = nullptr;
+    result->parser = nullptr;
+    result->generation_prompt = nullptr;
+    result->chat_format = 0;
+    result->grammar_lazy = false;
+    result->grammar_triggers = nullptr;
+    result->grammar_triggers_count = 0;
+    result->preserved_tokens = nullptr;
+    result->preserved_tokens_count = 0;
+    result->additional_stops = nullptr;
+    result->additional_stops_count = 0;
+}
+
 extern "C" void llama_rs_string_free(char * ptr) {
     if (ptr) {
         std::free(ptr);
