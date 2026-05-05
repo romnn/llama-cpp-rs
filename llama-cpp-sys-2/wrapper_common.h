@@ -58,6 +58,9 @@ llama_rs_status llama_rs_chat_template_get_caps(
     const char * chat_template,
     struct llama_rs_chat_template_caps * out_caps);
 
+void llama_rs_backend_load_all(void);
+llama_rs_status llama_rs_backend_load_all_from_path(const char * dir_path);
+
 struct llama_sampler * llama_rs_sampler_init_grammar(
     const struct llama_vocab * vocab,
     const char * grammar_str,
