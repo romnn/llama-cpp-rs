@@ -251,6 +251,8 @@ extern "C" llama_rs_status llama_rs_apply_chat_template_with_tools_oaicompat(
     size_t message_count,
     const char * tools_json,
     const char * json_schema,
+    const char * reasoning_format,
+    bool enable_thinking,
     bool add_generation_prompt,
     struct llama_rs_chat_template_result * out_result) {
     if (!chat_template || !out_result) {
@@ -275,6 +277,10 @@ extern "C" llama_rs_status llama_rs_apply_chat_template_with_tools_oaicompat(
         common_chat_templates_inputs inputs;
         inputs.add_generation_prompt = add_generation_prompt;
         inputs.use_jinja = true;
+        inputs.enable_thinking = enable_thinking;
+        if (reasoning_format && std::strlen(reasoning_format) > 0) {
+            inputs.reasoning_format = common_reasoning_format_from_name(reasoning_format);
+        }
 
         inputs.messages.reserve(message_count);
         for (size_t i = 0; i < message_count; ++i) {
