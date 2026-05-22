@@ -1329,25 +1329,40 @@ fn main() {
             let filename = filename.to_str().unwrap();
             let dst = target_dir.join(filename);
             debug_log!("HARD LINK {} TO {}", asset.display(), dst.display());
-            if !dst.exists() {
-                std::fs::hard_link(asset.clone(), dst).unwrap();
-            }
+            replace_with_hard_link(&asset, &dst);
 
             // Copy DLLs to examples as well
             if target_dir.join("examples").exists() {
                 let dst = target_dir.join("examples").join(filename);
                 debug_log!("HARD LINK {} TO {}", asset.display(), dst.display());
-                if !dst.exists() {
-                    std::fs::hard_link(asset.clone(), dst).unwrap();
-                }
+                replace_with_hard_link(&asset, &dst);
             }
 
             // Copy DLLs to target/profile/deps as well for tests
             let dst = target_dir.join("deps").join(filename);
             debug_log!("HARD LINK {} TO {}", asset.display(), dst.display());
-            if !dst.exists() {
-                std::fs::hard_link(asset.clone(), dst).unwrap();
-            }
+            replace_with_hard_link(&asset, &dst);
         }
+    }
+}
+
+/// Create a hard link from `asset` to `dst`, replacing any existing entry
+/// (including a *broken* symlink left over from a prior build).
+///
+/// The previous code did `if !dst.exists() { hard_link.unwrap() }`, but
+/// `Path::exists()` follows symlinks and returns `false` for broken ones —
+/// then `hard_link` panics with `AlreadyExists` because the symlink path is
+/// still occupied. This pattern bit us when a previous build had populated
+/// `target/<profile>/{,deps,examples}/lib*.so` symlinks whose `.so.0`
+/// targets were later cleaned out of those specific directories (the cmake
+/// install only places the target in one of them).
+fn replace_with_hard_link(asset: &Path, dst: &Path) {
+    let _ = std::fs::remove_file(dst);
+    if let Err(err) = std::fs::hard_link(asset, dst) {
+        panic!(
+            "failed to hard_link {} -> {}: {err}",
+            asset.display(),
+            dst.display()
+        );
     }
 }
