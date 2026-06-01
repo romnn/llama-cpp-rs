@@ -971,6 +971,55 @@ fn main() {
 
     if cfg!(feature = "system-ggml") {
         config.define("LLAMA_USE_SYSTEM_GGML", "ON");
+        // ggml-sys (declared as an optional `[dependencies]` entry, activated by
+        // this feature) installs ggml under its own OUT_DIR and exports the path
+        // via `cargo:cmake_prefix_path=…`. Cargo surfaces that to our build script
+        // as `DEP_GGML_CMAKE_PREFIX_PATH`. Pointing CMAKE_PREFIX_PATH at it lets
+        // llama.cpp's `find_package(ggml REQUIRED)` resolve against the shared
+        // build instead of the bundled `llama.cpp/ggml/` tree.
+        let ggml_prefix = std::env::var("DEP_GGML_CMAKE_PREFIX_PATH").unwrap_or_else(|_| {
+            panic!(
+                "system-ggml feature is enabled but DEP_GGML_CMAKE_PREFIX_PATH is not set.\n\
+                 This means ggml-sys is not in the dependency graph. Did you forget to\n\
+                 enable the feature in the consuming workspace (e.g. via [patch.crates-io]\n\
+                 redirecting ggml-sys to a workspace-local crate)?"
+            )
+        });
+        config.define("CMAKE_PREFIX_PATH", &ggml_prefix);
+        println!("cargo:rerun-if-env-changed=DEP_GGML_INCLUDE");
+        println!("cargo:rerun-if-env-changed=DEP_GGML_CMAKE_PREFIX_PATH");
+        println!("cargo:rerun-if-env-changed=DEP_GGML_GGML_REV");
+
+        // Compile-time guard against silent ggml drift between the linked libggml
+        // and the bundled headers bindgen reads from. The linker resolves ggml
+        // symbols from `ggml-sys`'s pinned SHA, but bindgen processes wrapper.h
+        // which still points at this fork's bundled `llama.cpp/ggml/include/`
+        // tree. Those two MUST be the same SHA, or the generated Rust types
+        // silently disagree with the linked binary's layout — exactly the kind
+        // of ABI hellscape this whole unification effort is meant to prevent.
+        let bundled_sync = llama_src.join("scripts/sync-ggml.last");
+        let bundled_sha = std::fs::read_to_string(&bundled_sync)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "failed to read {} (needed to verify bundled ggml matches \
+                     ggml-sys's pin): {err}",
+                    bundled_sync.display()
+                )
+            })
+            .trim()
+            .to_owned();
+        if let Ok(expected_sha) = std::env::var("DEP_GGML_GGML_REV") {
+            if bundled_sha != expected_sha {
+                println!(
+                    "cargo:warning=ggml SHA drift: ggml-sys is pinned at {expected_sha} but \
+                     this fork's bundled llama.cpp/ggml synced from {bundled_sha}. The linked \
+                     libggml comes from ggml-sys's SHA, while bindgen reads bundled headers. \
+                     This is safe only if ggml's C API is binary-compatible across the drift \
+                     range. Consider bumping the llama.cpp submodule to a commit whose \
+                     scripts/sync-ggml.last matches ggml-sys's pin."
+                );
+            }
+        }
     }
 
     if cfg!(feature = "dynamic-backends") {

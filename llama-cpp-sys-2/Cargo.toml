@@ -71,6 +71,12 @@ include = [
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+# Optional shared-ggml backend. Activated by the `system-ggml` feature.
+# When enabled, our `build.rs` reads the install path from `DEP_GGML_CMAKE_PREFIX_PATH`
+# and passes it to CMake as `CMAKE_PREFIX_PATH`, so llama.cpp's own
+# `find_package(ggml REQUIRED)` (triggered by `LLAMA_USE_SYSTEM_GGML=ON`)
+# resolves against the externally-built ggml instead of the bundled copy.
+ggml-sys = { version = "*", optional = true }
 
 [build-dependencies]
 bindgen = { workspace = true }
@@ -88,12 +94,16 @@ default = ["common"]
 # size-constrained downstream binaries that only need the core inference API.
 # Enabled by default to preserve backwards compatibility.
 common = []
-cuda = []
+# Backend selection. When `system-ggml` is also enabled, each backend feature
+# is propagated into ggml-sys via `ggml-sys?/<backend>` (`?` only activates the
+# feature if ggml-sys is already in the dep graph). This guarantees the
+# externally-built libggml has matching backend symbols.
+cuda = ["ggml-sys?/cuda"]
 # Disables the need to dynamically link against libcuda.so / cuda.dll
 cuda-no-vmm = ["cuda"]
-metal = []
+metal = ["ggml-sys?/metal"]
 dynamic-link = []
-vulkan = []
+vulkan = ["ggml-sys?/vulkan"]
 # OpenCL backend (GGML_OPENCL=ON) — the Qualcomm-supported path for Adreno GPUs.
 # The build needs OpenCL headers + a libOpenCL.so to link; on a cross-compile
 # (e.g. Android) point CMake at them via the OPENCL_INCLUDE_DIR / OPENCL_LIBRARY
@@ -101,16 +111,16 @@ vulkan = []
 opencl = []
 # Build the BLAS backend with Intel MKL (x86_64-only; requires MKLROOT set).
 mkl = []
-openmp = []
+openmp = ["ggml-sys?/openmp"]
 # Link GNU OpenMP (`libgomp`) statically on GNU targets. This is useful for
 # downstreams that ship self-contained binaries while keeping OpenMP enabled.
 static-openmp = ["openmp"]
-rocm = []
+rocm = ["ggml-sys?/hipblas"]
 # Link the C++ standard library statically where the target toolchain supports
 # it. Currently used by Android and Linux GNU/musl targets.
 static-stdcxx = []
 shared-stdcxx = []
-system-ggml = []
+system-ggml = ["dep:ggml-sys"]
 system-ggml-static = ["system-ggml"]
 mtmd = []
 dynamic-backends = ["dynamic-link"]
