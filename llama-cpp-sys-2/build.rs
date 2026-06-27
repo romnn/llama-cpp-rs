@@ -495,6 +495,7 @@ fn main() {
         common_wrapper_build
             .cpp(true)
             .file("wrapper_common.cpp")
+            .file("wrapper_oai.cpp")
             .include(&llama_src)
             .include(llama_src.join("common"))
             .include(llama_src.join("include"))
