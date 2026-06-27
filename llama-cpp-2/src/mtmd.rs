@@ -477,7 +477,7 @@ impl MtmdBitmap {
         placeholder: bool,
     ) -> Result<Self, MtmdBitmapError> {
         let path_cstr = CString::new(path)?;
-        let bitmap = unsafe {
+        let wrapper = unsafe {
             llama_cpp_sys_2::mtmd_helper_bitmap_init_from_file(
                 ctx.context.as_ptr(),
                 path_cstr.as_ptr(),
@@ -485,7 +485,10 @@ impl MtmdBitmap {
             )
         };
 
-        let bitmap = NonNull::new(bitmap).ok_or(MtmdBitmapError::NullResult)?;
+        // As of llama.cpp #24736 these helpers return a wrapper struct
+        // (`bitmap` + optional `video_ctx`); we only build image/audio bitmaps,
+        // for which `video_ctx` is null.
+        let bitmap = NonNull::new(wrapper.bitmap).ok_or(MtmdBitmapError::NullResult)?;
         Ok(Self { bitmap })
     }
 
@@ -519,7 +522,7 @@ impl MtmdBitmap {
         data: &[u8],
         placeholder: bool,
     ) -> Result<Self, MtmdBitmapError> {
-        let bitmap = unsafe {
+        let wrapper = unsafe {
             llama_cpp_sys_2::mtmd_helper_bitmap_init_from_buf(
                 ctx.context.as_ptr(),
                 data.as_ptr(),
@@ -528,7 +531,7 @@ impl MtmdBitmap {
             )
         };
 
-        let bitmap = NonNull::new(bitmap).ok_or(MtmdBitmapError::NullResult)?;
+        let bitmap = NonNull::new(wrapper.bitmap).ok_or(MtmdBitmapError::NullResult)?;
         Ok(Self { bitmap })
     }
 
