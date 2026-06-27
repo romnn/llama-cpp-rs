@@ -132,6 +132,7 @@ llama_rs_status llama_rs_mtp_speculative_accept(
     struct llama_rs_mtp_speculative * spec,
     uint16_t n_accepted);
 
+void llama_rs_chat_template_result_free(struct llama_rs_chat_template_result * result);
 void llama_rs_string_free(char * ptr);
 
 #ifdef __cplusplus

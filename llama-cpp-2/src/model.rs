@@ -11,12 +11,13 @@ use crate::context::params::LlamaContextParams;
 use crate::context::LlamaContext;
 use crate::llama_backend::LlamaBackend;
 use crate::model::params::LlamaModelParams;
+use crate::openai::{ChatParseStateOaicompat, OpenAIChatTemplateParams};
 use crate::token::LlamaToken;
 use crate::token_type::{LlamaTokenAttr, LlamaTokenAttrs};
 use crate::{
-    ApplyChatTemplateError, ChatTemplateError, LlamaContextLoadError, LlamaLoraAdapterInitError,
-    LlamaModelLoadError, MetaValError, NewLlamaChatMessageError, StringToTokenError,
-    TokenToStringError,
+    status_is_ok, ApplyChatTemplateError, ChatParseError, ChatTemplateError, LlamaContextLoadError,
+    LlamaLoraAdapterInitError, LlamaModelLoadError, MetaValError, NewLlamaChatMessageError,
+    StringToTokenError, TokenToStringError,
 };
 
 pub mod params;
@@ -91,6 +92,55 @@ impl LlamaChatMessage {
             content: CString::new(content)?,
         })
     }
+}
+
+/// Grammar trigger kinds used for lazy grammar sampling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrammarTriggerType {
+    /// Trigger on a specific token.
+    Token = 0,
+    /// Trigger on a literal word.
+    Word = 1,
+    /// Trigger on a regex pattern.
+    Pattern = 2,
+    /// Trigger on a fully anchored regex pattern.
+    PatternFull = 3,
+}
+
+/// Lazy grammar trigger from chat template generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrammarTrigger {
+    /// Trigger kind.
+    pub trigger_type: GrammarTriggerType,
+    /// Trigger text or pattern.
+    pub value: String,
+    /// Token id for token triggers.
+    pub token: Option<LlamaToken>,
+}
+
+/// Result of applying a chat template with tool grammar support.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatTemplateResult {
+    /// Rendered chat prompt.
+    pub prompt: String,
+    /// Optional grammar generated from tool definitions.
+    pub grammar: Option<String>,
+    /// Whether to use lazy grammar sampling.
+    pub grammar_lazy: bool,
+    /// Lazy grammar triggers derived from the template.
+    pub grammar_triggers: Vec<GrammarTrigger>,
+    /// Tokens that should be preserved for sampling.
+    pub preserved_tokens: Vec<String>,
+    /// Additional stop sequences added by the template.
+    pub additional_stops: Vec<String>,
+    /// Chat format used for parsing responses.
+    pub chat_format: i32,
+    /// Optional serialized PEG parser for tool-call parsing.
+    pub parser: Option<String>,
+    /// Prefix that must be prepended for parser-compatible response reconstruction.
+    pub generation_prompt: String,
+    /// Whether tool calls should be parsed from the response.
+    pub parse_tool_calls: bool,
 }
 
 /// The Rope type that's used within the model.

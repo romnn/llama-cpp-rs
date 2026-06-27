@@ -843,6 +843,11 @@ extern "C" llama_rs_status llama_rs_chat_msgs_to_oaicompat_json(
     }
 }
 
+// Mirrors `server_chat_msg_diff_to_json_oaicompat` in upstream
+// `tools/server/server-chat.cpp`. The conversion routine used to live in
+// `common/chat.cpp` as `common_chat_msg_diff_to_json_oaicompat`, but llama.cpp PR
+// #20690 moved it into the server tool, so it is no longer linkable from the
+// common library we build against.
 extern "C" llama_rs_status llama_rs_chat_msg_diff_to_oaicompat_json(
     const struct llama_rs_chat_msg_diff_oaicompat * diff,
     char ** out_json) {
@@ -852,21 +857,38 @@ extern "C" llama_rs_status llama_rs_chat_msg_diff_to_oaicompat_json(
     *out_json = nullptr;
 
     try {
-        common_chat_msg_diff msg_diff;
-        msg_diff.reasoning_content_delta =
-            diff->reasoning_content_delta ? diff->reasoning_content_delta : "";
-        msg_diff.content_delta =
-            diff->content_delta ? diff->content_delta : "";
-        msg_diff.tool_call_index = diff->tool_call_index;
-        if (diff->tool_call_index != std::string::npos) {
-            msg_diff.tool_call_delta.name =
-                diff->tool_call_delta.name ? diff->tool_call_delta.name : "";
-            msg_diff.tool_call_delta.arguments =
-                diff->tool_call_delta.arguments ? diff->tool_call_delta.arguments : "";
-            msg_diff.tool_call_delta.id =
-                diff->tool_call_delta.id ? diff->tool_call_delta.id : "";
+        json delta = json::object();
+        if (diff->reasoning_content_delta && diff->reasoning_content_delta[0] != '\0') {
+            delta["reasoning_content"] = diff->reasoning_content_delta;
         }
-        auto json_delta = common_chat_msg_diff_to_json_oaicompat(msg_diff).dump();
+        if (diff->content_delta && diff->content_delta[0] != '\0') {
+            delta["content"] = diff->content_delta;
+        }
+        if (diff->tool_call_index != std::string::npos) {
+            json tool_call;
+            tool_call["index"] = diff->tool_call_index;
+            const bool has_id = diff->tool_call_delta.id && diff->tool_call_delta.id[0] != '\0';
+            const bool has_name =
+                diff->tool_call_delta.name && diff->tool_call_delta.name[0] != '\0';
+            const bool has_arguments =
+                diff->tool_call_delta.arguments && diff->tool_call_delta.arguments[0] != '\0';
+            if (has_id) {
+                tool_call["id"]   = diff->tool_call_delta.id;
+                tool_call["type"] = "function";
+            }
+            if (has_name || has_arguments) {
+                json function = json::object();
+                if (has_name) {
+                    function["name"] = diff->tool_call_delta.name;
+                }
+                if (has_arguments) {
+                    function["arguments"] = diff->tool_call_delta.arguments;
+                }
+                tool_call["function"] = function;
+            }
+            delta["tool_calls"] = json::array({ tool_call });
+        }
+        auto json_delta = delta.dump();
         *out_json = llama_rs_dup_string(json_delta);
         return *out_json ? LLAMA_RS_STATUS_OK : LLAMA_RS_STATUS_ALLOCATION_FAILED;
     } catch (const std::exception &) {
