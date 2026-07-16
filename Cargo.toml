@@ -8,7 +8,6 @@ members = [
   "examples/reranker",
   "examples/mtmd",
   "generate-bindings",
-  "examples/server",
 ]
 
 [workspace.dependencies]
