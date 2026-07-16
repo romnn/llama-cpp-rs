@@ -49,18 +49,6 @@ static std::string random_string(size_t length = 32) {
     return result;
 }
 
-static bool ends_with(const std::string & value, const std::string & suffix) {
-    return value.size() >= suffix.size()
-        && value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
-}
-
-static bool detect_thinking_forced_open(const common_chat_params & params) {
-    return params.supports_thinking
-        && !params.thinking_start_tag.empty()
-        && !params.thinking_end_tag.empty()
-        && ends_with(params.generation_prompt, params.thinking_start_tag);
-}
-
 static void init_chat_msg(struct llama_rs_chat_msg_oaicompat * out_msg) {
     if (!out_msg) {
         return;
@@ -263,6 +251,9 @@ extern "C" llama_rs_status llama_rs_apply_chat_template_with_tools_oaicompat(
     out_result->grammar = nullptr;
     out_result->parser = nullptr;
     out_result->generation_prompt = nullptr;
+    out_result->thinking_start_tag = nullptr;
+    out_result->thinking_end_tag = nullptr;
+    out_result->supports_thinking = false;
     out_result->chat_format = 0;
     out_result->grammar_lazy = false;
     out_result->grammar_triggers = nullptr;
@@ -308,6 +299,13 @@ extern "C" llama_rs_status llama_rs_apply_chat_template_with_tools_oaicompat(
         if (!params.generation_prompt.empty()) {
             out_result->generation_prompt = llama_rs_dup_string(params.generation_prompt);
         }
+        if (!params.thinking_start_tag.empty()) {
+            out_result->thinking_start_tag = llama_rs_dup_string(params.thinking_start_tag);
+        }
+        if (!params.thinking_end_tag.empty()) {
+            out_result->thinking_end_tag = llama_rs_dup_string(params.thinking_end_tag);
+        }
+        out_result->supports_thinking = params.supports_thinking;
         out_result->chat_format = static_cast<int>(params.format);
         out_result->grammar_lazy = params.grammar_lazy;
         const auto status_triggers = dup_trigger_array(
@@ -334,7 +332,9 @@ extern "C" llama_rs_status llama_rs_apply_chat_template_with_tools_oaicompat(
             llama_rs_chat_template_result_free(out_result);
             return status_stops;
         }
-        if (!out_result->prompt) {
+        if (!out_result->prompt
+            || (!params.thinking_start_tag.empty() && !out_result->thinking_start_tag)
+            || (!params.thinking_end_tag.empty() && !out_result->thinking_end_tag)) {
             llama_rs_chat_template_result_free(out_result);
             return LLAMA_RS_STATUS_ALLOCATION_FAILED;
         }
@@ -365,6 +365,9 @@ extern "C" llama_rs_status llama_rs_apply_chat_template_oaicompat(
     out_result->grammar = nullptr;
     out_result->parser = nullptr;
     out_result->generation_prompt = nullptr;
+    out_result->thinking_start_tag = nullptr;
+    out_result->thinking_end_tag = nullptr;
+    out_result->supports_thinking = false;
     out_result->chat_format = 0;
     out_result->grammar_lazy = false;
     out_result->grammar_triggers = nullptr;
@@ -421,6 +424,13 @@ extern "C" llama_rs_status llama_rs_apply_chat_template_oaicompat(
         if (!params_out.generation_prompt.empty()) {
             out_result->generation_prompt = llama_rs_dup_string(params_out.generation_prompt);
         }
+        if (!params_out.thinking_start_tag.empty()) {
+            out_result->thinking_start_tag = llama_rs_dup_string(params_out.thinking_start_tag);
+        }
+        if (!params_out.thinking_end_tag.empty()) {
+            out_result->thinking_end_tag = llama_rs_dup_string(params_out.thinking_end_tag);
+        }
+        out_result->supports_thinking = params_out.supports_thinking;
         out_result->chat_format = static_cast<int>(params_out.format);
         out_result->grammar_lazy = params_out.grammar_lazy;
 
@@ -448,7 +458,9 @@ extern "C" llama_rs_status llama_rs_apply_chat_template_oaicompat(
             llama_rs_chat_template_result_free(out_result);
             return status_stops;
         }
-        if (!out_result->prompt) {
+        if (!out_result->prompt
+            || (!params_out.thinking_start_tag.empty() && !out_result->thinking_start_tag)
+            || (!params_out.thinking_end_tag.empty() && !out_result->thinking_end_tag)) {
             llama_rs_chat_template_result_free(out_result);
             return LLAMA_RS_STATUS_ALLOCATION_FAILED;
         }

@@ -4,6 +4,7 @@ use std::os::raw::c_int;
 use std::path::Path;
 use std::ptr::NonNull;
 use std::str::Utf8Error;
+use std::sync::Arc;
 
 use crate::context::params::LlamaContextParams;
 use crate::context::LlamaContext;
@@ -139,6 +140,12 @@ pub struct ChatTemplateResult {
     pub parser: Option<String>,
     /// Prefix that must be prepended for parser-compatible response reconstruction.
     pub generation_prompt: String,
+    /// Marker that opens a reasoning block when the template supports thinking.
+    pub thinking_start_tag: Option<String>,
+    /// Marker that closes a reasoning block when the template supports thinking.
+    pub thinking_end_tag: Option<String>,
+    /// Whether this rendered template supports generated reasoning content.
+    pub supports_thinking: bool,
     /// Whether tool calls should be parsed from the response.
     pub parse_tool_calls: bool,
 }
@@ -146,9 +153,15 @@ pub struct ChatTemplateResult {
 /// The Rope type that's used within the model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RopeType {
+    /// Standard rotary positional embeddings.
     Norm,
+    /// GPT-NeoX rotary positional embeddings.
     NeoX,
+    /// Multi-dimensional rotary positional embeddings.
     MRope,
+    /// Interleaved multi-dimensional rotary positional embeddings.
+    IMRope,
+    /// Rotary positional embeddings used by vision models.
     Vision,
 }
 
@@ -331,6 +344,7 @@ impl LlamaModel {
             llama_cpp_sys_2::LLAMA_ROPE_TYPE_NORM => Some(RopeType::Norm),
             llama_cpp_sys_2::LLAMA_ROPE_TYPE_NEOX => Some(RopeType::NeoX),
             llama_cpp_sys_2::LLAMA_ROPE_TYPE_MROPE => Some(RopeType::MRope),
+            llama_cpp_sys_2::LLAMA_ROPE_TYPE_IMROPE => Some(RopeType::IMRope),
             llama_cpp_sys_2::LLAMA_ROPE_TYPE_VISION => Some(RopeType::Vision),
             rope_type => {
                 tracing::error!(rope_type = rope_type, "Unexpected rope type from llama.cpp");
@@ -449,7 +463,35 @@ impl LlamaModel {
         };
         let context = NonNull::new(context).ok_or(LlamaContextLoadError::NullReturn)?;
 
-        Ok(LlamaContext::new(self, context, params.embeddings()))
+        Ok(LlamaContext::new_borrowed(
+            self,
+            context,
+            params.embeddings(),
+        ))
+    }
+
+    /// Creates a context that keeps this model allocation alive through shared ownership.
+    ///
+    /// The returned context can be moved to a dedicated inference thread without extending a
+    /// borrowed model lifetime or separately coordinating model and context drop order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlamaContextLoadError`] when llama.cpp cannot allocate the context.
+    pub fn new_context_owned(
+        self: Arc<Self>,
+        _: &LlamaBackend,
+        params: LlamaContextParams,
+    ) -> Result<LlamaContext<'static>, LlamaContextLoadError> {
+        let context_params = params.context_params;
+        // SAFETY: The model pointer remains alive because ownership of `self` moves into the
+        // returned context after this call succeeds.
+        let context = unsafe {
+            llama_cpp_sys_2::llama_new_context_with_model(self.model.as_ptr(), context_params)
+        };
+        let context = NonNull::new(context).ok_or(LlamaContextLoadError::NullReturn)?;
+
+        Ok(LlamaContext::new_owned(self, context, params.embeddings()))
     }
 
     /// Create a new context bound to another context via llama.cpp's `ctx_other` field.
@@ -475,7 +517,11 @@ impl LlamaModel {
         };
         let context = NonNull::new(context).ok_or(LlamaContextLoadError::NullReturn)?;
 
-        Ok(LlamaContext::new(self, context, params.embeddings()))
+        Ok(LlamaContext::new_borrowed(
+            self,
+            context,
+            params.embeddings(),
+        ))
     }
 
     /// Creates a new context with backend samplers attached for specific sequences.
@@ -658,6 +704,9 @@ impl LlamaModel {
             grammar: ptr::null_mut(),
             parser: ptr::null_mut(),
             generation_prompt: ptr::null_mut(),
+            thinking_start_tag: ptr::null_mut(),
+            thinking_end_tag: ptr::null_mut(),
+            supports_thinking: false,
             chat_format: 0,
             grammar_lazy: false,
             grammar_triggers: ptr::null_mut(),
@@ -726,6 +775,8 @@ impl LlamaModel {
                         .to_vec();
                 String::from_utf8(generation_prompt_bytes)?
             };
+            let thinking_start_tag = optional_ffi_string(raw_result.thinking_start_tag)?;
+            let thinking_end_tag = optional_ffi_string(raw_result.thinking_end_tag)?;
             let grammar_triggers = if raw_result.grammar_triggers_count == 0 {
                 Vec::new()
             } else if raw_result.grammar_triggers.is_null() {
@@ -818,6 +869,9 @@ impl LlamaModel {
                 chat_format: raw_result.chat_format,
                 parser,
                 generation_prompt,
+                thinking_start_tag,
+                thinking_end_tag,
+                supports_thinking: raw_result.supports_thinking,
                 parse_tool_calls,
             })
         })();
@@ -847,6 +901,9 @@ impl LlamaModel {
             grammar: ptr::null_mut(),
             parser: ptr::null_mut(),
             generation_prompt: ptr::null_mut(),
+            thinking_start_tag: ptr::null_mut(),
+            thinking_end_tag: ptr::null_mut(),
+            supports_thinking: false,
             chat_format: 0,
             grammar_lazy: false,
             grammar_triggers: ptr::null_mut(),
@@ -931,6 +988,8 @@ impl LlamaModel {
                         .to_vec();
                 String::from_utf8(generation_prompt_bytes)?
             };
+            let thinking_start_tag = optional_ffi_string(raw_result.thinking_start_tag)?;
+            let thinking_end_tag = optional_ffi_string(raw_result.thinking_end_tag)?;
             let grammar_triggers = if raw_result.grammar_triggers_count == 0 {
                 Vec::new()
             } else if raw_result.grammar_triggers.is_null() {
@@ -1023,6 +1082,9 @@ impl LlamaModel {
                 chat_format: raw_result.chat_format,
                 parser,
                 generation_prompt,
+                thinking_start_tag,
+                thinking_end_tag,
+                supports_thinking: raw_result.supports_thinking,
                 parse_tool_calls,
             })
         })();
@@ -1030,6 +1092,16 @@ impl LlamaModel {
         unsafe { llama_cpp_sys_2::llama_rs_chat_template_result_free(&mut raw_result) };
         result
     }
+}
+
+fn optional_ffi_string(value: *const c_char) -> Result<Option<String>, ApplyChatTemplateError> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: The wrapper returns an owned, null-terminated string for every non-null field and
+    // keeps it alive until `llama_rs_chat_template_result_free` runs after this conversion.
+    let bytes = unsafe { CStr::from_ptr(value) }.to_bytes().to_vec();
+    Ok(Some(String::from_utf8(bytes)?))
 }
 
 impl ChatTemplateResult {
