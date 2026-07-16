@@ -5,6 +5,7 @@ use std::fmt::{Debug, Formatter};
 use std::marker::PhantomData;
 use std::num::NonZeroI32;
 use std::slice;
+use std::sync::Arc;
 
 use crate::llama_batch::LlamaBatch;
 use crate::model::{LlamaLoraAdapter, LlamaModel};
@@ -20,6 +21,8 @@ use crate::{
 };
 
 pub mod kv_cache;
+#[cfg(feature = "common")]
+pub mod memory;
 pub mod params;
 pub mod session;
 
@@ -27,20 +30,31 @@ pub mod session;
 #[allow(clippy::module_name_repetitions)]
 pub struct LlamaContext<'a> {
     pub(crate) context: Ptr<llama_cpp_sys_2::llama_context>,
+    model: LlamaContextModel<'a>,
     /// Backend samplers kept alive for the context's lifetime.
     _backend_samplers: Vec<(i32, LlamaSampler)>,
-    /// The context internally holds a reference to the model, which can be
-    /// retrieved with `llama_get_model`.
-    model: PhantomData<&'a LlamaModel>,
     /// Some data in the context acts as-if behind a `Cell`, such as
     /// `t_start_us` and `n_eval`.
     data: PhantomData<Cell<()>>,
 }
 
-// SAFETY: The context itself isn't inherently bound to any particular thread.
-//
-// A lot of operations mutate internal state though (`ctx->synchronize()`),
-// which means that this cannot be `Sync`, see `synchronizable_ptr` below.
+enum LlamaContextModel<'a> {
+    Borrowed(&'a LlamaModel),
+    Owned(Arc<LlamaModel>),
+}
+
+impl LlamaContextModel<'_> {
+    fn as_model(&self) -> &LlamaModel {
+        match self {
+            Self::Borrowed(model) => model,
+            Self::Owned(model) => model,
+        }
+    }
+}
+
+// SAFETY: A llama.cpp context may move between threads as long as only its owner accesses it.
+// `LlamaContext` provides no shared mutable access, and its model is `Sync` for the full context
+// lifetime in both the borrowed and owned representations.
 unsafe impl Send for LlamaContext<'_> {}
 
 impl Debug for LlamaContext<'_> {
@@ -52,11 +66,14 @@ impl Debug for LlamaContext<'_> {
 }
 
 impl<'model> LlamaContext<'model> {
-    pub(crate) fn new(llama_context: Ptr<llama_cpp_sys_2::llama_context>) -> Self {
+    pub(crate) fn new_borrowed(
+        llama_model: &'model LlamaModel,
+        llama_context: Ptr<llama_cpp_sys_2::llama_context>,
+    ) -> Self {
         Self {
             context: llama_context,
+            model: LlamaContextModel::Borrowed(llama_model),
             _backend_samplers: Vec::new(),
-            model: PhantomData,
             data: PhantomData,
         }
     }
@@ -68,9 +85,28 @@ impl<'model> LlamaContext<'model> {
         Self {
             context: llama_context,
             _backend_samplers: backend_samplers,
-            model: PhantomData,
             data: PhantomData,
         }
+    }
+
+    pub(crate) fn new_owned(
+        llama_model: Arc<LlamaModel>,
+        llama_context: Ptr<llama_cpp_sys_2::llama_context>,
+    ) -> LlamaContext<'static> {
+        LlamaContext {
+            context: llama_context,
+            model: LlamaContextModel::Owned(llama_model),
+            _backend_samplers: Vec::new(),
+            data: PhantomData,
+        }
+    }
+
+    /// Returns the model allocation that remains valid for this context's lifetime.
+    #[must_use]
+    pub fn model(&self) -> &LlamaModel {
+        self.model.as_model()
+    }
+
     }
 
     // FIXME(madsmtm): Somehow return `LlamaModel<'_>` here?
@@ -94,6 +130,16 @@ impl<'model> LlamaContext<'model> {
     #[must_use]
     pub fn n_ctx(&self) -> u32 {
         unsafe { llama_cpp_sys_2::llama_n_ctx(self.context.as_ptr()) }
+    }
+
+    /// Gets the context size available to each sequence.
+    ///
+    /// This can differ from the requested context size because llama.cpp may adjust context
+    /// parameters while constructing the context.
+    #[must_use]
+    pub fn n_ctx_seq(&self) -> u32 {
+        // SAFETY: A live `LlamaContext` owns a valid llama.cpp context pointer.
+        unsafe { llama_cpp_sys_2::llama_n_ctx_seq(self.context.as_ptr()) }
     }
 
     /// Decodes the batch.
