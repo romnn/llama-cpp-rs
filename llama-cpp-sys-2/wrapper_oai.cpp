@@ -421,6 +421,11 @@ extern "C" llama_rs_status llama_rs_chat_parse_to_oaicompat(
     } catch (const std::exception &) {
         llama_rs_chat_msg_free_oaicompat(out_msg);
         return LLAMA_RS_STATUS_EXCEPTION;
+    } catch (...) {
+        // A non-std exception must not unwind across the extern "C" boundary
+        // into Rust.
+        llama_rs_chat_msg_free_oaicompat(out_msg);
+        return LLAMA_RS_STATUS_EXCEPTION;
     }
 }
 
