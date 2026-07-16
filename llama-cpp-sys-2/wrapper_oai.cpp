@@ -3,7 +3,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
-#include <random>
 #include <string>
 #include <vector>
 
@@ -14,40 +13,6 @@
 #include <nlohmann/json.hpp>
 
 using json = nlohmann::ordered_json;
-
-struct llama_rs_chat_parse_state_oaicompat {
-    common_chat_parser_params syntax;
-    common_chat_msg chat_msg;
-    std::string generated_text;
-    std::vector<std::string> generated_tool_call_ids;
-
-    explicit llama_rs_chat_parse_state_oaicompat(common_chat_parser_params syntax_in)
-        : syntax(std::move(syntax_in)) {}
-};
-
-static std::string random_string(size_t length = 32) {
-    static constexpr char chars[] =
-        "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    static constexpr size_t chars_len = sizeof(chars) - 1;
-    if (length == 0) {
-        return std::string();
-    }
-
-    static thread_local std::mt19937 generator([]() {
-        std::random_device rd;
-        std::seed_seq seed{
-            rd(), rd(), rd(), rd(), rd(), rd(), rd(), rd(),
-        };
-        return std::mt19937(seed);
-    }());
-
-    std::uniform_int_distribution<size_t> distribution(0, chars_len - 1);
-    std::string result(length, '\0');
-    for (size_t i = 0; i < length; ++i) {
-        result[i] = chars[distribution(generator)];
-    }
-    return result;
-}
 
 static void init_chat_msg(struct llama_rs_chat_msg_oaicompat * out_msg) {
     if (!out_msg) {
@@ -174,61 +139,6 @@ static llama_rs_status fill_chat_msg(
         out_msg->tool_calls_count = msg.tool_calls.size();
     }
 
-    return LLAMA_RS_STATUS_OK;
-}
-
-static llama_rs_status to_common_chat_msg(
-    const struct llama_rs_chat_msg_oaicompat & msg,
-    common_chat_msg & out_msg) {
-    if (!msg.role) {
-        return LLAMA_RS_STATUS_INVALID_ARGUMENT;
-    }
-    out_msg.role = msg.role;
-    if (msg.content) {
-        out_msg.content = msg.content;
-    }
-    if (msg.content_parts_count > 0) {
-        if (!msg.content_parts) {
-            return LLAMA_RS_STATUS_INVALID_ARGUMENT;
-        }
-        out_msg.content_parts.reserve(msg.content_parts_count);
-        for (size_t i = 0; i < msg.content_parts_count; ++i) {
-            const auto & part = msg.content_parts[i];
-            if (!part.type || !part.text) {
-                return LLAMA_RS_STATUS_INVALID_ARGUMENT;
-            }
-            common_chat_msg_content_part item;
-            item.type = part.type;
-            item.text = part.text;
-            out_msg.content_parts.push_back(std::move(item));
-        }
-    }
-    if (msg.reasoning_content) {
-        out_msg.reasoning_content = msg.reasoning_content;
-    }
-    if (msg.tool_name) {
-        out_msg.tool_name = msg.tool_name;
-    }
-    if (msg.tool_call_id) {
-        out_msg.tool_call_id = msg.tool_call_id;
-    }
-    if (msg.tool_calls_count > 0) {
-        if (!msg.tool_calls) {
-            return LLAMA_RS_STATUS_INVALID_ARGUMENT;
-        }
-        out_msg.tool_calls.reserve(msg.tool_calls_count);
-        for (size_t i = 0; i < msg.tool_calls_count; ++i) {
-            const auto & call = msg.tool_calls[i];
-            if (!call.name || !call.arguments) {
-                return LLAMA_RS_STATUS_INVALID_ARGUMENT;
-            }
-            common_chat_tool_call tool_call;
-            tool_call.name = call.name;
-            tool_call.arguments = call.arguments;
-            tool_call.id = call.id ? call.id : "";
-            out_msg.tool_calls.push_back(std::move(tool_call));
-        }
-    }
     return LLAMA_RS_STATUS_OK;
 }
 
@@ -481,11 +391,11 @@ extern "C" llama_rs_status llama_rs_chat_parse_to_oaicompat(
     bool parse_tool_calls,
     const char * parser_data,
     const char * generation_prompt,
-    char ** out_json) {
-    if (!input || !out_json) {
+    struct llama_rs_chat_msg_oaicompat * out_msg) {
+    if (!input || !out_msg) {
         return LLAMA_RS_STATUS_INVALID_ARGUMENT;
     }
-    *out_json = nullptr;
+    init_chat_msg(out_msg);
 
     try {
         common_chat_parser_params syntax;
@@ -498,13 +408,18 @@ extern "C" llama_rs_status llama_rs_chat_parse_to_oaicompat(
             syntax.parser.load(parser_data);
         }
 
-        auto msg = common_chat_parse(input, is_partial, syntax);
-        std::vector<std::string> ids_cache;
-        msg.set_tool_call_ids(ids_cache, []() { return random_string(); });
-        auto json_msg = msg.to_json_oaicompat().dump();
-        *out_json = llama_rs_dup_string(json_msg);
-        return *out_json ? LLAMA_RS_STATUS_OK : LLAMA_RS_STATUS_ALLOCATION_FAILED;
+        // Tool-call ids are intentionally left as parsed (usually empty): id
+        // assignment is caller policy, and generating ids here would require
+        // duplicating the id helpers llama.cpp keeps in its server tool.
+        const auto msg = common_chat_parse(input, is_partial, syntax);
+        const auto status = fill_chat_msg(msg, out_msg);
+        if (status != LLAMA_RS_STATUS_OK) {
+            llama_rs_chat_msg_free_oaicompat(out_msg);
+            return status;
+        }
+        return LLAMA_RS_STATUS_OK;
     } catch (const std::exception &) {
+        llama_rs_chat_msg_free_oaicompat(out_msg);
         return LLAMA_RS_STATUS_EXCEPTION;
     }
 }
@@ -552,397 +467,4 @@ extern "C" void llama_rs_chat_msg_free_oaicompat(struct llama_rs_chat_msg_oaicom
     msg->tool_call_id = nullptr;
     msg->tool_calls = nullptr;
     msg->tool_calls_count = 0;
-}
-
-extern "C" void llama_rs_chat_msgs_free_oaicompat(struct llama_rs_chat_msg_oaicompat * msgs, size_t count) {
-    if (!msgs) {
-        return;
-    }
-    for (size_t i = 0; i < count; ++i) {
-        llama_rs_chat_msg_free_oaicompat(&msgs[i]);
-    }
-    std::free(msgs);
-}
-
-extern "C" struct llama_rs_chat_parse_state_oaicompat * llama_rs_chat_parse_state_init_oaicompat(
-    int chat_format,
-    bool parse_tool_calls,
-    const char * parser_data,
-    const char * generation_prompt) {
-    try {
-        common_chat_parser_params syntax;
-        syntax.format = static_cast<common_chat_format>(chat_format);
-        syntax.parse_tool_calls = parse_tool_calls;
-        if (generation_prompt && std::strlen(generation_prompt) > 0) {
-            syntax.generation_prompt = generation_prompt;
-        }
-        if (parser_data && std::strlen(parser_data) > 0) {
-            syntax.parser.load(parser_data);
-        }
-        return new llama_rs_chat_parse_state_oaicompat(std::move(syntax));
-    } catch (const std::exception &) {
-        return nullptr;
-    }
-}
-
-extern "C" llama_rs_status llama_rs_chat_parse_state_update_oaicompat(
-    struct llama_rs_chat_parse_state_oaicompat * state,
-    const char * text_added,
-    bool is_partial,
-    struct llama_rs_chat_msg_oaicompat * out_msg,
-    struct llama_rs_chat_msg_diff_oaicompat ** out_diffs,
-    size_t * out_diffs_count) {
-    if (!state || !out_msg || !out_diffs || !out_diffs_count) {
-        return LLAMA_RS_STATUS_INVALID_ARGUMENT;
-    }
-    *out_diffs = nullptr;
-    *out_diffs_count = 0;
-    init_chat_msg(out_msg);
-
-    try {
-        if (text_added && text_added[0] != '\0') {
-            state->generated_text += text_added;
-        }
-        auto msg_prv_copy = state->chat_msg;
-        auto new_msg = common_chat_parse(state->generated_text, is_partial, state->syntax);
-        std::vector<common_chat_msg_diff> diffs;
-        if (!new_msg.empty()) {
-            new_msg.set_tool_call_ids(state->generated_tool_call_ids, []() {
-                return random_string();
-            });
-            state->chat_msg = new_msg;
-            diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, state->chat_msg);
-        }
-
-        const auto status = fill_chat_msg(state->chat_msg, out_msg);
-        if (status != LLAMA_RS_STATUS_OK) {
-            llama_rs_chat_msg_free_oaicompat(out_msg);
-            return status;
-        }
-
-        if (!diffs.empty()) {
-            auto * diff_arr = static_cast<struct llama_rs_chat_msg_diff_oaicompat *>(
-                std::malloc(sizeof(struct llama_rs_chat_msg_diff_oaicompat) * diffs.size()));
-            if (!diff_arr) {
-                llama_rs_chat_msg_free_oaicompat(out_msg);
-                return LLAMA_RS_STATUS_ALLOCATION_FAILED;
-            }
-            for (size_t i = 0; i < diffs.size(); ++i) {
-                diff_arr[i].reasoning_content_delta = nullptr;
-                diff_arr[i].content_delta = nullptr;
-                diff_arr[i].tool_call_delta.name = nullptr;
-                diff_arr[i].tool_call_delta.arguments = nullptr;
-                diff_arr[i].tool_call_delta.id = nullptr;
-                diff_arr[i].tool_call_index = diffs[i].tool_call_index;
-
-                if (!diffs[i].reasoning_content_delta.empty()) {
-                    diff_arr[i].reasoning_content_delta =
-                        llama_rs_dup_string(diffs[i].reasoning_content_delta);
-                    if (!diff_arr[i].reasoning_content_delta) {
-                        llama_rs_chat_msg_diff_free_oaicompat(diff_arr, i + 1);
-                        llama_rs_chat_msg_free_oaicompat(out_msg);
-                        return LLAMA_RS_STATUS_ALLOCATION_FAILED;
-                    }
-                }
-                if (!diffs[i].content_delta.empty()) {
-                    diff_arr[i].content_delta =
-                        llama_rs_dup_string(diffs[i].content_delta);
-                    if (!diff_arr[i].content_delta) {
-                        llama_rs_chat_msg_diff_free_oaicompat(diff_arr, i + 1);
-                        llama_rs_chat_msg_free_oaicompat(out_msg);
-                        return LLAMA_RS_STATUS_ALLOCATION_FAILED;
-                    }
-                }
-                if (diffs[i].tool_call_index != std::string::npos) {
-                    if (!diffs[i].tool_call_delta.name.empty()) {
-                        diff_arr[i].tool_call_delta.name =
-                            llama_rs_dup_string(diffs[i].tool_call_delta.name);
-                        if (!diff_arr[i].tool_call_delta.name) {
-                            llama_rs_chat_msg_diff_free_oaicompat(diff_arr, i + 1);
-                            llama_rs_chat_msg_free_oaicompat(out_msg);
-                            return LLAMA_RS_STATUS_ALLOCATION_FAILED;
-                        }
-                    }
-                    if (!diffs[i].tool_call_delta.arguments.empty()) {
-                        diff_arr[i].tool_call_delta.arguments =
-                            llama_rs_dup_string(diffs[i].tool_call_delta.arguments);
-                        if (!diff_arr[i].tool_call_delta.arguments) {
-                            llama_rs_chat_msg_diff_free_oaicompat(diff_arr, i + 1);
-                            llama_rs_chat_msg_free_oaicompat(out_msg);
-                            return LLAMA_RS_STATUS_ALLOCATION_FAILED;
-                        }
-                    }
-                    if (!diffs[i].tool_call_delta.id.empty()) {
-                        diff_arr[i].tool_call_delta.id =
-                            llama_rs_dup_string(diffs[i].tool_call_delta.id);
-                        if (!diff_arr[i].tool_call_delta.id) {
-                            llama_rs_chat_msg_diff_free_oaicompat(diff_arr, i + 1);
-                            llama_rs_chat_msg_free_oaicompat(out_msg);
-                            return LLAMA_RS_STATUS_ALLOCATION_FAILED;
-                        }
-                    }
-                }
-            }
-            *out_diffs = diff_arr;
-            *out_diffs_count = diffs.size();
-        }
-
-        return LLAMA_RS_STATUS_OK;
-    } catch (const std::exception &) {
-        llama_rs_chat_msg_free_oaicompat(out_msg);
-        return LLAMA_RS_STATUS_EXCEPTION;
-    }
-}
-
-extern "C" llama_rs_status llama_rs_chat_tools_parse_oaicompat(
-    const char * tools_json,
-    struct llama_rs_chat_tool_oaicompat ** out_tools,
-    size_t * out_count) {
-    if (!tools_json || !out_tools || !out_count) {
-        return LLAMA_RS_STATUS_INVALID_ARGUMENT;
-    }
-    *out_tools = nullptr;
-    *out_count = 0;
-
-    try {
-        auto tools = common_chat_tools_parse_oaicompat(json::parse(tools_json));
-        if (tools.empty()) {
-            return LLAMA_RS_STATUS_OK;
-        }
-
-        auto * items = static_cast<struct llama_rs_chat_tool_oaicompat *>(
-            std::malloc(sizeof(struct llama_rs_chat_tool_oaicompat) * tools.size()));
-        if (!items) {
-            return LLAMA_RS_STATUS_ALLOCATION_FAILED;
-        }
-        for (size_t i = 0; i < tools.size(); ++i) {
-            items[i].name = llama_rs_dup_string(tools[i].name);
-            items[i].description = llama_rs_dup_string(tools[i].description);
-            items[i].parameters = llama_rs_dup_string(tools[i].parameters);
-            if ((!items[i].name && !tools[i].name.empty())
-                || (!items[i].description && !tools[i].description.empty())
-                || (!items[i].parameters && !tools[i].parameters.empty())) {
-                for (size_t j = 0; j <= i; ++j) {
-                    std::free(items[j].name);
-                    std::free(items[j].description);
-                    std::free(items[j].parameters);
-                }
-                std::free(items);
-                return LLAMA_RS_STATUS_ALLOCATION_FAILED;
-            }
-        }
-        *out_tools = items;
-        *out_count = tools.size();
-        return LLAMA_RS_STATUS_OK;
-    } catch (const std::exception &) {
-        return LLAMA_RS_STATUS_EXCEPTION;
-    }
-}
-
-extern "C" llama_rs_status llama_rs_chat_tools_to_oaicompat_json(
-    const struct llama_rs_chat_tool_oaicompat * tools,
-    size_t tools_count,
-    char ** out_json) {
-    if (!out_json) {
-        return LLAMA_RS_STATUS_INVALID_ARGUMENT;
-    }
-    *out_json = nullptr;
-    if (tools_count > 0 && !tools) {
-        return LLAMA_RS_STATUS_INVALID_ARGUMENT;
-    }
-
-    try {
-        std::vector<common_chat_tool> parsed;
-        parsed.reserve(tools_count);
-        for (size_t i = 0; i < tools_count; ++i) {
-            if (!tools[i].name || !tools[i].parameters) {
-                return LLAMA_RS_STATUS_INVALID_ARGUMENT;
-            }
-            common_chat_tool tool;
-            tool.name = tools[i].name;
-            tool.description = tools[i].description ? tools[i].description : "";
-            tool.parameters = tools[i].parameters;
-            parsed.push_back(std::move(tool));
-        }
-        auto json_tools = common_chat_tools_to_json_oaicompat(parsed).dump();
-        *out_json = llama_rs_dup_string(json_tools);
-        return *out_json ? LLAMA_RS_STATUS_OK : LLAMA_RS_STATUS_ALLOCATION_FAILED;
-    } catch (const std::exception &) {
-        return LLAMA_RS_STATUS_EXCEPTION;
-    }
-}
-
-extern "C" void llama_rs_chat_tools_free_oaicompat(struct llama_rs_chat_tool_oaicompat * tools, size_t count) {
-    if (!tools) {
-        return;
-    }
-    for (size_t i = 0; i < count; ++i) {
-        std::free(tools[i].name);
-        std::free(tools[i].description);
-        std::free(tools[i].parameters);
-    }
-    std::free(tools);
-}
-
-extern "C" llama_rs_status llama_rs_chat_msgs_parse_oaicompat(
-    const char * messages_json,
-    struct llama_rs_chat_msg_oaicompat ** out_msgs,
-    size_t * out_count) {
-    if (!messages_json || !out_msgs || !out_count) {
-        return LLAMA_RS_STATUS_INVALID_ARGUMENT;
-    }
-    *out_msgs = nullptr;
-    *out_count = 0;
-
-    try {
-        auto msgs = common_chat_msgs_parse_oaicompat(json::parse(messages_json));
-        if (msgs.empty()) {
-            return LLAMA_RS_STATUS_OK;
-        }
-
-        auto * items = static_cast<struct llama_rs_chat_msg_oaicompat *>(
-            std::malloc(sizeof(struct llama_rs_chat_msg_oaicompat) * msgs.size()));
-        if (!items) {
-            return LLAMA_RS_STATUS_ALLOCATION_FAILED;
-        }
-        for (size_t i = 0; i < msgs.size(); ++i) {
-            const auto status = fill_chat_msg(msgs[i], &items[i]);
-            if (status != LLAMA_RS_STATUS_OK) {
-                for (size_t j = 0; j <= i; ++j) {
-                    llama_rs_chat_msg_free_oaicompat(&items[j]);
-                }
-                std::free(items);
-                return status;
-            }
-        }
-        *out_msgs = items;
-        *out_count = msgs.size();
-        return LLAMA_RS_STATUS_OK;
-    } catch (const std::exception &) {
-        return LLAMA_RS_STATUS_EXCEPTION;
-    }
-}
-
-extern "C" llama_rs_status llama_rs_chat_msgs_to_oaicompat_json(
-    const struct llama_rs_chat_msg_oaicompat * messages,
-    size_t messages_count,
-    bool concat_typed_text,
-    char ** out_json) {
-    if (!out_json) {
-        return LLAMA_RS_STATUS_INVALID_ARGUMENT;
-    }
-    *out_json = nullptr;
-    if (messages_count > 0 && !messages) {
-        return LLAMA_RS_STATUS_INVALID_ARGUMENT;
-    }
-
-    try {
-        std::vector<common_chat_msg> parsed;
-        parsed.reserve(messages_count);
-        for (size_t i = 0; i < messages_count; ++i) {
-            common_chat_msg msg;
-            const auto status = to_common_chat_msg(messages[i], msg);
-            if (status != LLAMA_RS_STATUS_OK) {
-                return status;
-            }
-            parsed.push_back(std::move(msg));
-        }
-        auto json_msgs = common_chat_msgs_to_json_oaicompat(parsed, concat_typed_text).dump();
-        *out_json = llama_rs_dup_string(json_msgs);
-        return *out_json ? LLAMA_RS_STATUS_OK : LLAMA_RS_STATUS_ALLOCATION_FAILED;
-    } catch (const std::exception &) {
-        return LLAMA_RS_STATUS_EXCEPTION;
-    }
-}
-
-// Mirrors `server_chat_msg_diff_to_json_oaicompat` in upstream
-// `tools/server/server-chat.cpp`. The conversion routine used to live in
-// `common/chat.cpp` as `common_chat_msg_diff_to_json_oaicompat`, but llama.cpp PR
-// #20690 moved it into the server tool, so it is no longer linkable from the
-// common library we build against.
-extern "C" llama_rs_status llama_rs_chat_msg_diff_to_oaicompat_json(
-    const struct llama_rs_chat_msg_diff_oaicompat * diff,
-    char ** out_json) {
-    if (!diff || !out_json) {
-        return LLAMA_RS_STATUS_INVALID_ARGUMENT;
-    }
-    *out_json = nullptr;
-
-    try {
-        json delta = json::object();
-        if (diff->reasoning_content_delta && diff->reasoning_content_delta[0] != '\0') {
-            delta["reasoning_content"] = diff->reasoning_content_delta;
-        }
-        if (diff->content_delta && diff->content_delta[0] != '\0') {
-            delta["content"] = diff->content_delta;
-        }
-        if (diff->tool_call_index != std::string::npos) {
-            json tool_call;
-            tool_call["index"] = diff->tool_call_index;
-            const bool has_id = diff->tool_call_delta.id && diff->tool_call_delta.id[0] != '\0';
-            const bool has_name =
-                diff->tool_call_delta.name && diff->tool_call_delta.name[0] != '\0';
-            const bool has_arguments =
-                diff->tool_call_delta.arguments && diff->tool_call_delta.arguments[0] != '\0';
-            if (has_id) {
-                tool_call["id"]   = diff->tool_call_delta.id;
-                tool_call["type"] = "function";
-            }
-            if (has_name || has_arguments) {
-                json function = json::object();
-                if (has_name) {
-                    function["name"] = diff->tool_call_delta.name;
-                }
-                if (has_arguments) {
-                    function["arguments"] = diff->tool_call_delta.arguments;
-                }
-                tool_call["function"] = function;
-            }
-            delta["tool_calls"] = json::array({ tool_call });
-        }
-        auto json_delta = delta.dump();
-        *out_json = llama_rs_dup_string(json_delta);
-        return *out_json ? LLAMA_RS_STATUS_OK : LLAMA_RS_STATUS_ALLOCATION_FAILED;
-    } catch (const std::exception &) {
-        return LLAMA_RS_STATUS_EXCEPTION;
-    }
-}
-
-extern "C" llama_rs_status llama_rs_chat_tool_choice_parse_oaicompat(
-    const char * tool_choice,
-    enum llama_rs_chat_tool_choice_oaicompat * out_choice) {
-    if (!out_choice) {
-        return LLAMA_RS_STATUS_INVALID_ARGUMENT;
-    }
-    if (!tool_choice || tool_choice[0] == '\0') {
-        *out_choice = LLAMA_RS_CHAT_TOOL_CHOICE_OAICOMPAT_AUTO;
-        return LLAMA_RS_STATUS_OK;
-    }
-    try {
-        const auto parsed = common_chat_tool_choice_parse_oaicompat(tool_choice);
-        *out_choice = static_cast<llama_rs_chat_tool_choice_oaicompat>(parsed);
-        return LLAMA_RS_STATUS_OK;
-    } catch (const std::exception &) {
-        return LLAMA_RS_STATUS_EXCEPTION;
-    }
-}
-
-extern "C" void llama_rs_chat_msg_diff_free_oaicompat(
-    struct llama_rs_chat_msg_diff_oaicompat * diffs,
-    size_t count) {
-    if (!diffs) {
-        return;
-    }
-    for (size_t i = 0; i < count; ++i) {
-        std::free(diffs[i].reasoning_content_delta);
-        std::free(diffs[i].content_delta);
-        std::free(diffs[i].tool_call_delta.name);
-        std::free(diffs[i].tool_call_delta.arguments);
-        std::free(diffs[i].tool_call_delta.id);
-    }
-    std::free(diffs);
-}
-
-extern "C" void llama_rs_chat_parse_state_free_oaicompat(struct llama_rs_chat_parse_state_oaicompat * state) {
-    delete state;
 }
