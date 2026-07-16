@@ -1,5 +1,6 @@
 //! A safe wrapper around `llama_model`.
 use std::ffi::{c_char, CStr, CString};
+use std::mem;
 use std::num::NonZeroU16;
 use std::os::raw::c_int;
 use std::path::Path;
@@ -12,7 +13,7 @@ use crate::context::params::LlamaContextParams;
 use crate::context::LlamaContext;
 use crate::llama_backend::LlamaBackend;
 use crate::model::params::LlamaModelParams;
-use crate::openai::{ChatParseStateOaicompat, OpenAIChatTemplateParams};
+use crate::openai::{ChatMessageOaicompat, OpenAIChatTemplateParams};
 use crate::token::LlamaToken;
 use crate::token_type::{LlamaTokenAttr, LlamaTokenAttrs};
 use crate::{
@@ -1453,12 +1454,20 @@ fn optional_ffi_string(value: *const c_char) -> Result<Option<String>, ApplyChat
 }
 
 impl ChatTemplateResult {
-    /// Parse a generated response into an OpenAI-compatible message JSON string.
+    /// Parse a generated response into OpenAI-compatible message fields.
+    ///
+    /// Tool-call ids are returned as parsed from the model output and are
+    /// usually absent; callers assign their own ids.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatParseError`] when the input contains a null byte, the
+    /// native parser rejects the input, or a parsed field is not valid UTF-8.
     pub fn parse_response_oaicompat(
         &self,
         text: &str,
         is_partial: bool,
-    ) -> Result<String, ChatParseError> {
+    ) -> Result<ChatMessageOaicompat, ChatParseError> {
         let text_cstr = CString::new(text)?;
         let parser_cstr = self.parser.as_deref().map(CString::new).transpose()?;
         let generation_prompt_cstr = if self.generation_prompt.is_empty() {
@@ -1466,7 +1475,7 @@ impl ChatTemplateResult {
         } else {
             Some(CString::new(self.generation_prompt.as_str())?)
         };
-        let mut out_json: *mut c_char = ptr::null_mut();
+        let mut out_msg: llama_cpp_sys_2::llama_rs_chat_msg_oaicompat = unsafe { mem::zeroed() };
         let rc = unsafe {
             llama_cpp_sys_2::llama_rs_chat_parse_to_oaicompat(
                 text_cstr.as_ptr(),
@@ -1479,47 +1488,18 @@ impl ChatTemplateResult {
                 generation_prompt_cstr
                     .as_ref()
                     .map_or(ptr::null(), |cstr| cstr.as_ptr()),
-                &mut out_json,
+                &mut out_msg,
             )
         };
 
-        let result = (|| {
-            if !status_is_ok(rc) {
-                return Err(ChatParseError::FfiError(rc));
-            }
-            if out_json.is_null() {
-                return Err(ChatParseError::NullResult);
-            }
-            let bytes = unsafe { CStr::from_ptr(out_json) }.to_bytes().to_vec();
-            Ok(String::from_utf8(bytes)?)
-        })();
-
-        unsafe { llama_cpp_sys_2::llama_rs_string_free(out_json) };
+        if !status_is_ok(rc) {
+            return Err(ChatParseError::FfiError(rc));
+        }
+        // SAFETY: On success the wrapper filled `out_msg` with owned
+        // allocations that stay valid until the free call below.
+        let result = unsafe { ChatMessageOaicompat::from_ffi(&out_msg) };
+        unsafe { llama_cpp_sys_2::llama_rs_chat_msg_free_oaicompat(&mut out_msg) };
         result
-    }
-
-    /// Initialize a streaming parser for OpenAI-compatible chat deltas.
-    pub fn streaming_state_oaicompat(&self) -> Result<ChatParseStateOaicompat, ChatParseError> {
-        let parser_cstr = self.parser.as_deref().map(CString::new).transpose()?;
-        let generation_prompt_cstr = if self.generation_prompt.is_empty() {
-            None
-        } else {
-            Some(CString::new(self.generation_prompt.as_str())?)
-        };
-        let state = unsafe {
-            llama_cpp_sys_2::llama_rs_chat_parse_state_init_oaicompat(
-                self.chat_format,
-                self.parse_tool_calls,
-                parser_cstr
-                    .as_ref()
-                    .map_or(ptr::null(), |cstr| cstr.as_ptr()),
-                generation_prompt_cstr
-                    .as_ref()
-                    .map_or(ptr::null(), |cstr| cstr.as_ptr()),
-            )
-        };
-        let state = NonNull::new(state).ok_or(ChatParseError::NullResult)?;
-        Ok(ChatParseStateOaicompat { state })
     }
 }
 
