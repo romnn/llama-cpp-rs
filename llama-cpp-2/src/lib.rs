@@ -439,9 +439,6 @@ pub enum ChatParseError {
     /// the string could not be converted to utf8.
     #[error("{0}")]
     Utf8Error(#[from] FromUtf8Error),
-    /// llama.cpp returned a null pointer for the parse result.
-    #[error("null result from llama.cpp")]
-    NullResult,
     /// llama.cpp returned an error code.
     #[error("ffi error {0}")]
     FfiError(i32),
