@@ -21,6 +21,9 @@ struct llama_rs_chat_template_result {
     char * grammar;
     char * parser;
     char * generation_prompt;
+    char * thinking_start_tag;
+    char * thinking_end_tag;
+    bool supports_thinking;
     int chat_format;
     bool grammar_lazy;
     struct llama_rs_grammar_trigger * grammar_triggers;
@@ -37,9 +40,21 @@ struct llama_rs_chat_template_caps {
     bool supports_system_role;
     bool supports_parallel_tool_calls;
     bool supports_preserve_reasoning;
+    bool supports_thinking;
     bool supports_string_content;
     bool supports_typed_content;
     bool supports_object_arguments;
+};
+
+struct llama_rs_memory_usage {
+    size_t model_bytes;
+    size_t context_bytes;
+    size_t compute_bytes;
+};
+
+struct llama_rs_device_memory_usage {
+    size_t device_index;
+    struct llama_rs_memory_usage usage;
 };
 
 #include "wrapper_utils.h"
@@ -84,6 +99,16 @@ struct llama_sampler * llama_rs_sampler_init_grammar_lazy_patterns(
     const llama_token * trigger_tokens,
     size_t num_trigger_tokens);
 
+struct llama_sampler * llama_rs_sampler_init_reasoning_budget(
+    const struct llama_vocab * vocab,
+    const llama_token * start_tokens,
+    size_t start_tokens_count,
+    const llama_token * end_tokens,
+    size_t end_tokens_count,
+    const llama_token * forced_tokens,
+    size_t forced_tokens_count,
+    int32_t budget);
+
 llama_rs_status llama_rs_sampler_accept(struct llama_sampler * sampler, llama_token token);
 
 // Fit model/context params to device memory (wraps llama.cpp's common_fit_params).
@@ -99,6 +124,18 @@ int llama_rs_fit_params(
     enum ggml_log_level log_level);
 
 void llama_rs_memory_breakdown_print(const struct llama_context * ctx);
+
+// Returns the memory attributed to host buffers and each model device. Call once with a null
+// device buffer and zero capacity to obtain the required device count, then call again with a
+// buffer of that size. Buffer types that cannot be associated with either location are returned
+// separately so callers do not silently undercount them.
+llama_rs_status llama_rs_get_memory_breakdown(
+    const struct llama_context * ctx,
+    struct llama_rs_memory_usage * out_host,
+    struct llama_rs_memory_usage * out_unattributed,
+    struct llama_rs_device_memory_usage * out_devices,
+    size_t device_capacity,
+    size_t * out_device_count);
 
 struct llama_rs_mtp_speculative * llama_rs_mtp_speculative_init(
     struct llama_context * ctx_tgt,

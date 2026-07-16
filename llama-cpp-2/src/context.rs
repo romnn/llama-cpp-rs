@@ -4,6 +4,7 @@ use std::fmt::{Debug, Formatter};
 use std::num::NonZeroI32;
 use std::ptr::NonNull;
 use std::slice;
+use std::sync::Arc;
 
 use crate::llama_batch::LlamaBatch;
 use crate::model::{LlamaLoraAdapter, LlamaModel};
@@ -17,6 +18,8 @@ use crate::{
 };
 
 pub mod kv_cache;
+#[cfg(feature = "common")]
+pub mod memory;
 pub mod params;
 pub mod session;
 
@@ -24,11 +27,29 @@ pub mod session;
 #[allow(clippy::module_name_repetitions)]
 pub struct LlamaContext<'a> {
     pub(crate) context: NonNull<llama_cpp_sys_2::llama_context>,
-    /// a reference to the contexts model.
-    pub model: &'a LlamaModel,
+    model: LlamaContextModel<'a>,
     initialized_logits: Vec<i32>,
     embeddings_enabled: bool,
 }
+
+enum LlamaContextModel<'a> {
+    Borrowed(&'a LlamaModel),
+    Owned(Arc<LlamaModel>),
+}
+
+impl LlamaContextModel<'_> {
+    fn as_model(&self) -> &LlamaModel {
+        match self {
+            Self::Borrowed(model) => model,
+            Self::Owned(model) => model,
+        }
+    }
+}
+
+// SAFETY: A llama.cpp context may move between threads as long as only its owner accesses it.
+// `LlamaContext` provides no shared mutable access, and its model is `Sync` for the full context
+// lifetime in both the borrowed and owned representations.
+unsafe impl Send for LlamaContext<'_> {}
 
 impl Debug for LlamaContext<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -39,17 +60,36 @@ impl Debug for LlamaContext<'_> {
 }
 
 impl<'model> LlamaContext<'model> {
-    pub(crate) fn new(
+    pub(crate) fn new_borrowed(
         llama_model: &'model LlamaModel,
         llama_context: NonNull<llama_cpp_sys_2::llama_context>,
         embeddings_enabled: bool,
     ) -> Self {
         Self {
             context: llama_context,
-            model: llama_model,
+            model: LlamaContextModel::Borrowed(llama_model),
             initialized_logits: Vec::new(),
             embeddings_enabled,
         }
+    }
+
+    pub(crate) fn new_owned(
+        llama_model: Arc<LlamaModel>,
+        llama_context: NonNull<llama_cpp_sys_2::llama_context>,
+        embeddings_enabled: bool,
+    ) -> LlamaContext<'static> {
+        LlamaContext {
+            context: llama_context,
+            model: LlamaContextModel::Owned(llama_model),
+            initialized_logits: Vec::new(),
+            embeddings_enabled,
+        }
+    }
+
+    /// Returns the model allocation that remains valid for this context's lifetime.
+    #[must_use]
+    pub fn model(&self) -> &LlamaModel {
+        self.model.as_model()
     }
 
     /// Gets the max number of logical tokens that can be submitted to decode. Must be greater than or equal to [`Self::n_ubatch`].
@@ -68,6 +108,16 @@ impl<'model> LlamaContext<'model> {
     #[must_use]
     pub fn n_ctx(&self) -> u32 {
         unsafe { llama_cpp_sys_2::llama_n_ctx(self.context.as_ptr()) }
+    }
+
+    /// Gets the context size available to each sequence.
+    ///
+    /// This can differ from the requested context size because llama.cpp may adjust context
+    /// parameters while constructing the context.
+    #[must_use]
+    pub fn n_ctx_seq(&self) -> u32 {
+        // SAFETY: A live `LlamaContext` owns a valid llama.cpp context pointer.
+        unsafe { llama_cpp_sys_2::llama_n_ctx_seq(self.context.as_ptr()) }
     }
 
     /// Decodes the batch.
@@ -138,7 +188,7 @@ impl<'model> LlamaContext<'model> {
         }
 
         let n_embd =
-            usize::try_from(self.model.n_embd()).expect("n_embd does not fit into a usize");
+            usize::try_from(self.model().n_embd()).expect("n_embd does not fit into a usize");
 
         unsafe {
             let embedding = llama_cpp_sys_2::llama_get_embeddings_seq(self.context.as_ptr(), i);
@@ -174,7 +224,7 @@ impl<'model> LlamaContext<'model> {
         }
 
         let n_embd =
-            usize::try_from(self.model.n_embd()).expect("n_embd does not fit into a usize");
+            usize::try_from(self.model().n_embd()).expect("n_embd does not fit into a usize");
 
         unsafe {
             let embedding = llama_cpp_sys_2::llama_get_embeddings_ith(self.context.as_ptr(), i);
@@ -237,7 +287,8 @@ impl<'model> LlamaContext<'model> {
     pub fn get_logits(&self) -> &[f32] {
         let data = unsafe { llama_cpp_sys_2::llama_get_logits(self.context.as_ptr()) };
         assert!(!data.is_null(), "logits data for last token is null");
-        let len = usize::try_from(self.model.n_vocab()).expect("n_vocab does not fit into a usize");
+        let len =
+            usize::try_from(self.model().n_vocab()).expect("n_vocab does not fit into a usize");
 
         unsafe { slice::from_raw_parts(data, len) }
     }
@@ -291,7 +342,8 @@ impl<'model> LlamaContext<'model> {
         );
 
         let data = unsafe { llama_cpp_sys_2::llama_get_logits_ith(self.context.as_ptr(), i) };
-        let len = usize::try_from(self.model.n_vocab()).expect("n_vocab does not fit into a usize");
+        let len =
+            usize::try_from(self.model().n_vocab()).expect("n_vocab does not fit into a usize");
 
         unsafe { slice::from_raw_parts(data, len) }
     }

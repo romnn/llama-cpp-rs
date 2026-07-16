@@ -12,8 +12,10 @@
 #include "llama.cpp/common/common.h"
 #include "llama.cpp/common/fit.h"
 #include "llama.cpp/common/json-schema-to-grammar.h"
+#include "llama.cpp/common/reasoning-budget.h"
 #include "llama.cpp/common/speculative.h"
 #include "llama.cpp/include/llama.h"
+#include "llama.cpp/src/llama-ext.h"
 #include "wrapper_utils.h"
 
 #include <nlohmann/json.hpp>
@@ -62,6 +64,7 @@ extern "C" llama_rs_status llama_rs_chat_template_get_caps(
         out_caps->supports_system_role = read_cap("supports_system_role");
         out_caps->supports_parallel_tool_calls = read_cap("supports_parallel_tool_calls");
         out_caps->supports_preserve_reasoning = read_cap("supports_preserve_reasoning");
+        out_caps->supports_thinking = common_chat_templates_support_enable_thinking(tmpls.get());
         out_caps->supports_string_content = read_cap("supports_string_content");
         out_caps->supports_typed_content = read_cap("supports_typed_content");
         out_caps->supports_object_arguments = read_cap("supports_object_arguments");
@@ -107,6 +110,12 @@ extern "C" void llama_rs_chat_template_result_free(struct llama_rs_chat_template
     if (result->generation_prompt) {
         std::free(result->generation_prompt);
     }
+    if (result->thinking_start_tag) {
+        std::free(result->thinking_start_tag);
+    }
+    if (result->thinking_end_tag) {
+        std::free(result->thinking_end_tag);
+    }
     if (result->grammar_triggers) {
         for (size_t i = 0; i < result->grammar_triggers_count; ++i) {
             std::free(result->grammar_triggers[i].value);
@@ -129,6 +138,9 @@ extern "C" void llama_rs_chat_template_result_free(struct llama_rs_chat_template
     result->grammar = nullptr;
     result->parser = nullptr;
     result->generation_prompt = nullptr;
+    result->thinking_start_tag = nullptr;
+    result->thinking_end_tag = nullptr;
+    result->supports_thinking = false;
     result->chat_format = 0;
     result->grammar_lazy = false;
     result->grammar_triggers = nullptr;
@@ -137,6 +149,42 @@ extern "C" void llama_rs_chat_template_result_free(struct llama_rs_chat_template
     result->preserved_tokens_count = 0;
     result->additional_stops = nullptr;
     result->additional_stops_count = 0;
+}
+
+extern "C" struct llama_sampler * llama_rs_sampler_init_reasoning_budget(
+    const struct llama_vocab * vocab,
+    const llama_token * start_tokens,
+    size_t start_tokens_count,
+    const llama_token * end_tokens,
+    size_t end_tokens_count,
+    const llama_token * forced_tokens,
+    size_t forced_tokens_count,
+    int32_t budget) {
+    if (!vocab
+        || !start_tokens
+        || start_tokens_count == 0
+        || !end_tokens
+        || end_tokens_count == 0
+        || !forced_tokens
+        || forced_tokens_count == 0
+        || budget < 0) {
+        return nullptr;
+    }
+
+    try {
+        const std::vector<llama_token> start(start_tokens, start_tokens + start_tokens_count);
+        const std::vector<llama_token> end(end_tokens, end_tokens + end_tokens_count);
+        const std::vector<llama_token> forced(forced_tokens, forced_tokens + forced_tokens_count);
+        return common_reasoning_budget_init(
+            vocab,
+            start,
+            end,
+            forced,
+            budget,
+            REASONING_BUDGET_IDLE);
+    } catch (...) {
+        return nullptr;
+    }
 }
 
 extern "C" void llama_rs_string_free(char * ptr) {
@@ -251,6 +299,87 @@ extern "C" int llama_rs_fit_params(
 
 extern "C" void llama_rs_memory_breakdown_print(const struct llama_context * ctx) {
     common_memory_breakdown_print(ctx);
+}
+
+extern "C" llama_rs_status llama_rs_get_memory_breakdown(
+    const struct llama_context * ctx,
+    struct llama_rs_memory_usage * out_host,
+    struct llama_rs_memory_usage * out_unattributed,
+    struct llama_rs_device_memory_usage * out_devices,
+    size_t device_capacity,
+    size_t * out_device_count) {
+    if (!ctx || !out_host || !out_unattributed || !out_device_count ||
+        (!out_devices && device_capacity != 0)) {
+        return LLAMA_RS_STATUS_INVALID_ARGUMENT;
+    }
+
+    *out_host = {};
+    *out_unattributed = {};
+    *out_device_count = 0;
+
+    try {
+        const auto * model = llama_get_model(ctx);
+        if (!model) {
+            return LLAMA_RS_STATUS_INVALID_ARGUMENT;
+        }
+
+        const int32_t signed_device_count = llama_model_n_devices(model);
+        if (signed_device_count < 0) {
+            return LLAMA_RS_STATUS_EXCEPTION;
+        }
+        const size_t device_count = static_cast<size_t>(signed_device_count);
+        *out_device_count = device_count;
+
+        if (!out_devices) {
+            return LLAMA_RS_STATUS_OK;
+        }
+        if (device_capacity < device_count) {
+            return LLAMA_RS_STATUS_INVALID_ARGUMENT;
+        }
+
+        for (size_t i = 0; i < device_count; ++i) {
+            out_devices[i] = {};
+            out_devices[i].device_index = i;
+        }
+
+        const auto add_usage = [](
+            struct llama_rs_memory_usage & destination,
+            const llama_memory_breakdown_data & source) {
+            destination.model_bytes += source.model;
+            destination.context_bytes += source.context;
+            destination.compute_bytes += source.compute;
+        };
+
+        const llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
+        for (const auto & [buffer_type, usage] : memory_breakdown) {
+            if (ggml_backend_buft_is_host(buffer_type)) {
+                add_usage(*out_host, usage);
+                continue;
+            }
+
+            const ggml_backend_dev_t device = ggml_backend_buft_get_device(buffer_type);
+            bool matched_device = false;
+            if (device) {
+                for (size_t i = 0; i < device_count; ++i) {
+                    if (device == llama_model_get_device(model, static_cast<int>(i))) {
+                        add_usage(out_devices[i].usage, usage);
+                        matched_device = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!matched_device) {
+                add_usage(*out_unattributed, usage);
+            }
+        }
+
+        return LLAMA_RS_STATUS_OK;
+    } catch (const std::exception &) {
+        return LLAMA_RS_STATUS_EXCEPTION;
+    } catch (...) {
+        return LLAMA_RS_STATUS_EXCEPTION;
+    }
 }
 
 struct llama_rs_mtp_speculative {

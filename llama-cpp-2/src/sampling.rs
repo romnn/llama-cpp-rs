@@ -11,6 +11,8 @@ use crate::status_is_ok;
 use crate::token::data_array::LlamaTokenDataArray;
 use crate::token::logit_bias::LlamaLogitBias;
 use crate::token::LlamaToken;
+#[cfg(feature = "common")]
+use crate::ReasoningBudgetError;
 use crate::{GrammarError, SamplerAcceptError};
 
 /// A safe wrapper around `llama_sampler`.
@@ -399,6 +401,53 @@ impl LlamaSampler {
         }
     }
 
+    /// Limits the number of tokens generated inside each reasoning block.
+    ///
+    /// The sampler watches `start_tokens` and `end_tokens`. Once a start sequence is accepted, it
+    /// allows at most `budget` further reasoning tokens before forcing `forced_tokens`. The forced
+    /// sequence should contain any budget-exhaustion message followed by the complete reasoning end
+    /// marker.
+    ///
+    /// Template-provided generation prompt tokens must be accepted by this sampler before
+    /// generation starts. This lets a prompt ending in an opening reasoning marker activate the
+    /// budget immediately. Place the sampler before probabilistic token selectors in a sampler
+    /// chain so its forced logits remain authoritative.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReasoningBudgetError`] when a required token sequence is empty, the budget exceeds
+    /// llama.cpp's signed range, or llama.cpp cannot allocate the sampler.
+    #[cfg(feature = "common")]
+    pub fn reasoning_budget(
+        model: &LlamaModel,
+        start_tokens: &[LlamaToken],
+        end_tokens: &[LlamaToken],
+        forced_tokens: &[LlamaToken],
+        budget: u32,
+    ) -> Result<Self, ReasoningBudgetError> {
+        let budget =
+            validate_reasoning_budget_inputs(start_tokens, end_tokens, forced_tokens, budget)?;
+        // SAFETY: The model owns a live vocabulary, and each non-empty slice remains valid for the
+        // duration of the call. The wrapper copies every token before returning.
+        let sampler = unsafe {
+            llama_cpp_sys_2::llama_rs_sampler_init_reasoning_budget(
+                model.vocab_ptr(),
+                start_tokens.as_ptr().cast(),
+                start_tokens.len(),
+                end_tokens.as_ptr().cast(),
+                end_tokens.len(),
+                forced_tokens.as_ptr().cast(),
+                forced_tokens.len(),
+                budget,
+            )
+        };
+        if sampler.is_null() {
+            Err(ReasoningBudgetError::NullSampler)
+        } else {
+            Ok(Self { sampler })
+        }
+    }
+
     /// Builds the `toktrie` tokenizer environment for `model`.
     ///
     /// Use this to construct your own `llguidance::ParserFactory` (with any slice
@@ -625,6 +674,61 @@ impl LlamaSampler {
         };
 
         Self { sampler }
+    }
+}
+
+#[cfg(feature = "common")]
+fn validate_reasoning_budget_inputs(
+    start_tokens: &[LlamaToken],
+    end_tokens: &[LlamaToken],
+    forced_tokens: &[LlamaToken],
+    budget: u32,
+) -> Result<i32, ReasoningBudgetError> {
+    if start_tokens.is_empty() {
+        return Err(ReasoningBudgetError::EmptyStartTokens);
+    }
+    if end_tokens.is_empty() {
+        return Err(ReasoningBudgetError::EmptyEndTokens);
+    }
+    if forced_tokens.is_empty() {
+        return Err(ReasoningBudgetError::EmptyForcedTokens);
+    }
+    i32::try_from(budget).map_err(|_| ReasoningBudgetError::BudgetTooLarge(budget))
+}
+
+#[cfg(all(test, feature = "common"))]
+mod tests {
+    use super::validate_reasoning_budget_inputs;
+    use crate::token::LlamaToken;
+    use crate::ReasoningBudgetError;
+
+    #[test]
+    fn reasoning_budget_rejects_missing_token_sequences() {
+        let token = [LlamaToken::new(1)];
+
+        assert_eq!(
+            validate_reasoning_budget_inputs(&[], &token, &token, 1),
+            Err(ReasoningBudgetError::EmptyStartTokens)
+        );
+        assert_eq!(
+            validate_reasoning_budget_inputs(&token, &[], &token, 1),
+            Err(ReasoningBudgetError::EmptyEndTokens)
+        );
+        assert_eq!(
+            validate_reasoning_budget_inputs(&token, &token, &[], 1),
+            Err(ReasoningBudgetError::EmptyForcedTokens)
+        );
+    }
+
+    #[test]
+    fn reasoning_budget_rejects_values_outside_llama_cpp_range() {
+        let token = [LlamaToken::new(1)];
+        let budget = u32::MAX;
+
+        assert_eq!(
+            validate_reasoning_budget_inputs(&token, &token, &token, budget),
+            Err(ReasoningBudgetError::BudgetTooLarge(budget))
+        );
     }
 }
 

@@ -1,6 +1,7 @@
 //! utilities for working with the kv cache
 
 use crate::context::LlamaContext;
+use crate::model::RopeType;
 use std::ffi::c_int;
 use std::num::{NonZeroU8, TryFromIntError};
 
@@ -20,6 +21,9 @@ pub enum KvCacheConversionError {
     /// Partial sequence couldn't be removed
     #[error("Couldn't remove partial sequence")]
     PartialSequenceRemovalFailed(i32, i32),
+    /// The loaded model's memory layout does not support position shifts.
+    #[error("the loaded model does not support kv-cache position shifts")]
+    PositionShiftUnsupported,
 }
 
 impl LlamaContext<'_> {
@@ -106,6 +110,23 @@ impl LlamaContext<'_> {
         unsafe { llama_cpp_sys_2::llama_memory_clear(mem, true) }
     }
 
+    /// Reports whether the loaded model and its memory support position shifts.
+    ///
+    /// Callers must check this before shifting or dividing cached positions. The native position
+    /// update requires one position per embedding, while mRoPE uses a multi-position layout. The
+    /// explicit model check preserves that invariant independently of native capability reporting.
+    #[must_use]
+    pub fn memory_can_shift(&self) -> bool {
+        if !rope_type_supports_position_shifts(self.model().rope_type()) {
+            return false;
+        }
+        // SAFETY: A live `LlamaContext` owns a valid context and its associated memory handle.
+        unsafe {
+            let mem = llama_cpp_sys_2::llama_get_memory(self.context.as_ptr());
+            llama_cpp_sys_2::llama_memory_can_shift(mem)
+        }
+    }
+
     /// Removes all tokens that do not belong to the specified sequence
     ///
     /// # Parameters
@@ -169,7 +190,8 @@ impl LlamaContext<'_> {
     /// * `delta` - The relative position to add to the tokens
     ///
     /// # Errors
-    /// If either position exceeds [`i32::MAX`].
+    /// Returns an error when either position exceeds [`i32::MAX`] or the loaded model's memory
+    /// does not support position shifts.
     pub fn kv_cache_seq_add(
         &mut self,
         seq_id: i32,
@@ -177,6 +199,9 @@ impl LlamaContext<'_> {
         p1: Option<u32>,
         delta: i32,
     ) -> Result<(), KvCacheConversionError> {
+        if !self.memory_can_shift() {
+            return Err(KvCacheConversionError::PositionShiftUnsupported);
+        }
         let p0 = p0
             .map_or(Ok(-1), i32::try_from)
             .map_err(KvCacheConversionError::P0TooLarge)?;
@@ -240,7 +265,8 @@ impl LlamaContext<'_> {
     /// * `d` - The factor to divide the positions by
     ///
     /// # Errors
-    /// If either position exceeds [`i32::MAX`].
+    /// Returns an error when either position exceeds [`i32::MAX`] or the loaded model's memory
+    /// does not support position shifts.
     pub fn kv_cache_seq_div(
         &mut self,
         seq_id: i32,
@@ -248,6 +274,9 @@ impl LlamaContext<'_> {
         p1: Option<u32>,
         d: NonZeroU8,
     ) -> Result<(), KvCacheConversionError> {
+        if !self.memory_can_shift() {
+            return Err(KvCacheConversionError::PositionShiftUnsupported);
+        }
         let p0 = p0
             .map_or(Ok(-1), i32::try_from)
             .map_err(KvCacheConversionError::P0TooLarge)?;
@@ -280,5 +309,24 @@ impl LlamaContext<'_> {
     pub fn kv_cache_seq_pos_max(&self, seq_id: i32) -> i32 {
         let mem = unsafe { llama_cpp_sys_2::llama_get_memory(self.context.as_ptr()) };
         unsafe { llama_cpp_sys_2::llama_memory_seq_pos_max(mem, seq_id) }
+    }
+}
+
+fn rope_type_supports_position_shifts(rope_type: Option<RopeType>) -> bool {
+    !matches!(rope_type, Some(RopeType::MRope | RopeType::IMRope))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multi_position_rope_types_do_not_support_position_shifts() {
+        assert!(!rope_type_supports_position_shifts(Some(RopeType::MRope)));
+        assert!(!rope_type_supports_position_shifts(Some(RopeType::IMRope)));
+        assert!(rope_type_supports_position_shifts(Some(RopeType::Norm)));
+        assert!(rope_type_supports_position_shifts(Some(RopeType::NeoX)));
+        assert!(rope_type_supports_position_shifts(Some(RopeType::Vision)));
+        assert!(rope_type_supports_position_shifts(None));
     }
 }

@@ -455,6 +455,27 @@ pub enum SamplerAcceptError {
     FfiError(i32),
 }
 
+/// Failed to initialize a reasoning-budget sampler.
+#[cfg(feature = "common")]
+#[derive(Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ReasoningBudgetError {
+    /// The opening reasoning marker did not produce any tokens.
+    #[error("reasoning start tokens are empty")]
+    EmptyStartTokens,
+    /// The closing reasoning marker did not produce any tokens.
+    #[error("reasoning end tokens are empty")]
+    EmptyEndTokens,
+    /// The sequence forced when the budget expires did not produce any tokens.
+    #[error("reasoning forced tokens are empty")]
+    EmptyForcedTokens,
+    /// The requested token budget exceeds llama.cpp's signed budget range.
+    #[error("reasoning budget exceeds the signed 32-bit range: {0}")]
+    BudgetTooLarge(u32),
+    /// llama.cpp could not create the sampler.
+    #[error("reasoning budget sampler returned null")]
+    NullSampler,
+}
+
 /// Get the time in microseconds according to ggml
 ///
 /// ```
