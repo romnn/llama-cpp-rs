@@ -5,6 +5,7 @@ use std::os::raw::c_int;
 use std::path::Path;
 use std::ptr::NonNull;
 use std::str::Utf8Error;
+use std::string::FromUtf8Error;
 use std::sync::Arc;
 
 use crate::context::params::LlamaContextParams;
@@ -1095,12 +1096,13 @@ impl LlamaModel {
     }
 }
 
-fn optional_ffi_string(value: *const c_char) -> Result<Option<String>, ApplyChatTemplateError> {
+/// Duplicates an optional wrapper-owned C string into an owned Rust string.
+pub(crate) fn optional_ffi_string(value: *const c_char) -> Result<Option<String>, FromUtf8Error> {
     if value.is_null() {
         return Ok(None);
     }
     // SAFETY: The wrapper returns an owned, null-terminated string for every non-null field and
-    // keeps it alive until `llama_rs_chat_template_result_free` runs after this conversion.
+    // keeps it alive until the matching free call runs after this conversion.
     let bytes = unsafe { CStr::from_ptr(value) }.to_bytes().to_vec();
     Ok(Some(String::from_utf8(bytes)?))
 }

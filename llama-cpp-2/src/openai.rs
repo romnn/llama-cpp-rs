@@ -1,7 +1,6 @@
 //! OpenAI-compatible utility methods.
+use crate::model::optional_ffi_string;
 use crate::ChatParseError;
-use std::ffi::CStr;
-use std::os::raw::c_char;
 use std::slice;
 
 /// Parameters for applying OpenAI-compatible chat templates.
@@ -84,17 +83,6 @@ pub struct ChatMessageOaicompat {
     pub tool_calls: Vec<ChatMessageToolCallOaicompat>,
 }
 
-fn owned_ffi_string(value: *const c_char) -> Result<Option<String>, ChatParseError> {
-    if value.is_null() {
-        return Ok(None);
-    }
-    // SAFETY: The wrapper returns owned, null-terminated strings for every
-    // non-null field, and they stay alive until the message is freed after
-    // conversion.
-    let bytes = unsafe { CStr::from_ptr(value) }.to_bytes().to_vec();
-    Ok(Some(String::from_utf8(bytes)?))
-}
-
 impl ChatMessageOaicompat {
     /// Converts the FFI message into an owned value without taking ownership
     /// of the FFI allocations; the caller still frees `msg`.
@@ -117,27 +105,27 @@ impl ChatMessageOaicompat {
         };
 
         Ok(Self {
-            role: owned_ffi_string(msg.role)?.unwrap_or_default(),
-            content: owned_ffi_string(msg.content)?,
+            role: optional_ffi_string(msg.role)?.unwrap_or_default(),
+            content: optional_ffi_string(msg.content)?,
             content_parts: content_parts
                 .iter()
                 .map(|part| {
                     Ok(ChatMessageContentPartOaicompat {
-                        part_type: owned_ffi_string(part.type_)?.unwrap_or_default(),
-                        text: owned_ffi_string(part.text)?.unwrap_or_default(),
+                        part_type: optional_ffi_string(part.type_)?.unwrap_or_default(),
+                        text: optional_ffi_string(part.text)?.unwrap_or_default(),
                     })
                 })
                 .collect::<Result<_, ChatParseError>>()?,
-            reasoning_content: owned_ffi_string(msg.reasoning_content)?,
-            tool_name: owned_ffi_string(msg.tool_name)?,
-            tool_call_id: owned_ffi_string(msg.tool_call_id)?,
+            reasoning_content: optional_ffi_string(msg.reasoning_content)?,
+            tool_name: optional_ffi_string(msg.tool_name)?,
+            tool_call_id: optional_ffi_string(msg.tool_call_id)?,
             tool_calls: tool_calls
                 .iter()
                 .map(|tool_call| {
                     Ok(ChatMessageToolCallOaicompat {
-                        name: owned_ffi_string(tool_call.name)?.unwrap_or_default(),
-                        arguments: owned_ffi_string(tool_call.arguments)?.unwrap_or_default(),
-                        id: owned_ffi_string(tool_call.id)?.filter(|id| !id.is_empty()),
+                        name: optional_ffi_string(tool_call.name)?.unwrap_or_default(),
+                        arguments: optional_ffi_string(tool_call.arguments)?.unwrap_or_default(),
+                        id: optional_ffi_string(tool_call.id)?.filter(|id| !id.is_empty()),
                     })
                 })
                 .collect::<Result<_, ChatParseError>>()?,
