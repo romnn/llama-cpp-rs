@@ -1,8 +1,12 @@
 //! Memory attribution for a loaded llama.cpp context.
 
 use std::collections::TryReserveError;
+use std::ffi::{CString, NulError};
+use std::path::{Path, PathBuf};
 
+use crate::context::params::LlamaContextParams;
 use crate::context::LlamaContext;
+use crate::model::params::LlamaModelParams;
 
 /// Memory bytes grouped by the allocation's role.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -51,6 +55,15 @@ pub struct LlamaMemoryBreakdown {
 /// Errors returned while collecting llama.cpp memory attribution.
 #[derive(Debug, thiserror::Error)]
 pub enum LlamaMemoryBreakdownError {
+    /// The model path cannot be passed to llama.cpp as UTF-8.
+    #[error("model path is not valid utf-8: {path}")]
+    PathToStr {
+        /// Path that could not be represented.
+        path: PathBuf,
+    },
+    /// The model path contains an interior NUL byte.
+    #[error("model path contains a nul byte")]
+    PathContainsNul(#[source] NulError),
     /// The native wrapper rejected or failed the query.
     #[error("llama.cpp memory breakdown query failed with status {status}")]
     Native {
@@ -134,11 +147,105 @@ impl LlamaContext<'_> {
     }
 }
 
+/// Projects model, context, and compute-buffer memory without allocating their backing storage.
+///
+/// The model and context parameters must be the same values the eventual load will use. Device
+/// entries follow the model's llama.cpp device order, just like [`LlamaContext::memory_breakdown`].
+/// The projection can omit backend buffers created only while model weights are materialized, such
+/// as CPU repacking buffers, and does not include driver or allocator caches. Prefer a measured
+/// breakdown from the loaded context whenever one is available.
+///
+/// # Errors
+///
+/// Returns an error when the path cannot be passed to llama.cpp, the native projection fails, or
+/// Rust cannot reserve its device result buffer.
+pub fn estimate_memory_breakdown(
+    model_path: &Path,
+    model_params: &LlamaModelParams,
+    context_params: &LlamaContextParams,
+) -> Result<LlamaMemoryBreakdown, LlamaMemoryBreakdownError> {
+    let model_path_string =
+        model_path
+            .to_str()
+            .ok_or_else(|| LlamaMemoryBreakdownError::PathToStr {
+                path: model_path.to_path_buf(),
+            })?;
+    let model_path =
+        CString::new(model_path_string).map_err(LlamaMemoryBreakdownError::PathContainsNul)?;
+    let device_capacity = crate::max_devices();
+    let mut raw_host = raw_memory_usage();
+    let mut raw_unattributed = raw_memory_usage();
+    let mut raw_devices = raw_device_buffer(device_capacity)?;
+    let mut device_count = 0_usize;
+
+    // SAFETY: All parameter and output pointers remain valid for the call. The initialized device
+    // buffer has one entry per device llama.cpp can represent, and the wrapper validates its
+    // capacity before writing.
+    let status = unsafe {
+        llama_cpp_sys_2::llama_rs_estimate_memory_breakdown(
+            model_path.as_ptr(),
+            &raw const model_params.params,
+            &raw const context_params.context_params,
+            &raw mut raw_host,
+            &raw mut raw_unattributed,
+            raw_devices.as_mut_ptr(),
+            raw_devices.len(),
+            &raw mut device_count,
+        )
+    };
+    status_to_result(status)?;
+
+    Ok(memory_breakdown_from_raw(
+        raw_host,
+        raw_unattributed,
+        raw_devices,
+        device_count,
+    ))
+}
+
 fn raw_memory_usage() -> llama_cpp_sys_2::llama_rs_memory_usage {
     llama_cpp_sys_2::llama_rs_memory_usage {
         model_bytes: 0,
         context_bytes: 0,
         compute_bytes: 0,
+    }
+}
+
+fn raw_device_buffer(
+    device_count: usize,
+) -> Result<Vec<llama_cpp_sys_2::llama_rs_device_memory_usage>, LlamaMemoryBreakdownError> {
+    let mut raw_devices = Vec::new();
+    raw_devices
+        .try_reserve_exact(device_count)
+        .map_err(LlamaMemoryBreakdownError::Allocation)?;
+    for device_index in 0..device_count {
+        raw_devices.push(llama_cpp_sys_2::llama_rs_device_memory_usage {
+            device_index,
+            usage: raw_memory_usage(),
+        });
+    }
+    Ok(raw_devices)
+}
+
+fn memory_breakdown_from_raw(
+    raw_host: llama_cpp_sys_2::llama_rs_memory_usage,
+    raw_unattributed: llama_cpp_sys_2::llama_rs_memory_usage,
+    raw_devices: Vec<llama_cpp_sys_2::llama_rs_device_memory_usage>,
+    device_count: usize,
+) -> LlamaMemoryBreakdown {
+    let devices = raw_devices
+        .into_iter()
+        .take(device_count)
+        .map(|device| LlamaDeviceMemoryUsage {
+            device_index: device.device_index,
+            usage: device.usage.into(),
+        })
+        .collect();
+
+    LlamaMemoryBreakdown {
+        host: raw_host.into(),
+        devices,
+        unattributed: raw_unattributed.into(),
     }
 }
 

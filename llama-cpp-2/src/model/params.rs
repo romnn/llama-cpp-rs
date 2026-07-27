@@ -540,6 +540,9 @@ impl LlamaModelParams {
     }
 
     /// sets `use_mmap`
+    ///
+    /// Clearing this drops to [`llama_cpp_sys_2::LLAMA_LOAD_MODE_NONE`], which also clears
+    /// mlock, since mlock cannot hold without the mapping it is defined in terms of.
     #[must_use]
     pub fn with_use_mmap(mut self, use_mmap: bool) -> Self {
         self.params.load_mode = load_mode_from_flags(use_mmap, self.use_mlock());
