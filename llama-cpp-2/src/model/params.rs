@@ -159,8 +159,8 @@ impl Debug for LlamaModelParams {
             .field("n_gpu_layers", &self.params.n_gpu_layers)
             .field("main_gpu", &self.params.main_gpu)
             .field("vocab_only", &self.params.vocab_only)
-            .field("use_mmap", &self.params.use_mmap)
-            .field("use_mlock", &self.params.use_mlock)
+            .field("use_mmap", &self.use_mmap())
+            .field("use_mlock", &self.use_mlock())
             .field("split_mode", &self.split_mode())
             .field("devices", &self.devices)
             .field("kv_overrides", &"vec of kv_overrides")
@@ -436,15 +436,19 @@ impl LlamaModelParams {
     }
 
     /// use mmap if possible
+    ///
+    /// llama.cpp models loading as a single `load_mode` enum rather than independent
+    /// `use_mmap` / `use_mlock` flags. Mlock subsumes mmap, so it reads as both.
     #[must_use]
     pub fn use_mmap(&self) -> bool {
-        self.params.use_mmap
+        self.params.load_mode == llama_cpp_sys_2::LLAMA_LOAD_MODE_MMAP
+            || self.params.load_mode == llama_cpp_sys_2::LLAMA_LOAD_MODE_MLOCK
     }
 
     /// force system to keep model in RAM
     #[must_use]
     pub fn use_mlock(&self) -> bool {
-        self.params.use_mlock
+        self.params.load_mode == llama_cpp_sys_2::LLAMA_LOAD_MODE_MLOCK
     }
 
     /// get the split mode
@@ -512,16 +516,33 @@ impl LlamaModelParams {
     }
 
     /// sets `use_mmap`
+    ///
+    /// Clearing this drops to [`llama_cpp_sys_2::LLAMA_LOAD_MODE_NONE`], which also clears
+    /// mlock, since mlock cannot hold without the mapping it is defined in terms of.
     #[must_use]
     pub fn with_use_mmap(mut self, use_mmap: bool) -> Self {
-        self.params.use_mmap = use_mmap;
+        self.params.load_mode = if !use_mmap {
+            llama_cpp_sys_2::LLAMA_LOAD_MODE_NONE
+        } else if self.params.load_mode == llama_cpp_sys_2::LLAMA_LOAD_MODE_MLOCK {
+            // Already the stronger mode; asking for mmap must not downgrade it.
+            llama_cpp_sys_2::LLAMA_LOAD_MODE_MLOCK
+        } else {
+            llama_cpp_sys_2::LLAMA_LOAD_MODE_MMAP
+        };
         self
     }
 
     /// sets `use_mlock`
     #[must_use]
     pub fn with_use_mlock(mut self, use_mlock: bool) -> Self {
-        self.params.use_mlock = use_mlock;
+        self.params.load_mode = if use_mlock {
+            llama_cpp_sys_2::LLAMA_LOAD_MODE_MLOCK
+        } else if self.params.load_mode == llama_cpp_sys_2::LLAMA_LOAD_MODE_MLOCK {
+            // Dropping mlock leaves behind the mapping it implied.
+            llama_cpp_sys_2::LLAMA_LOAD_MODE_MMAP
+        } else {
+            self.params.load_mode
+        };
         self
     }
 

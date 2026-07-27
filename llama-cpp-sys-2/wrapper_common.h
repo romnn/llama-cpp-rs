@@ -137,6 +137,20 @@ llama_rs_status llama_rs_get_memory_breakdown(
     size_t device_capacity,
     size_t * out_device_count);
 
+// Projects the memory breakdown without allocating model tensors or backend buffers. The caller
+// supplies the same model and context parameters it intends to load. Unlike the loaded-context
+// query above, callers should provide llama_max_devices() entries so this takes one projection
+// pass rather than parsing the model twice.
+llama_rs_status llama_rs_estimate_memory_breakdown(
+    const char * model_path,
+    const struct llama_model_params * model_params,
+    const struct llama_context_params * context_params,
+    struct llama_rs_memory_usage * out_host,
+    struct llama_rs_memory_usage * out_unattributed,
+    struct llama_rs_device_memory_usage * out_devices,
+    size_t device_capacity,
+    size_t * out_device_count);
+
 struct llama_rs_mtp_speculative * llama_rs_mtp_speculative_init(
     struct llama_context * ctx_tgt,
     struct llama_context * ctx_dft,

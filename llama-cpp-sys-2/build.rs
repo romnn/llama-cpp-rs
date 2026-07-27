@@ -1025,7 +1025,12 @@ fn main() {
         }
     }
 
-    if cfg!(feature = "dynamic-backends") {
+    // With `system-ggml`, ggml is built by the ggml-sys crate rather than here, so it owns
+    // the backend modules and the GGML_BACKEND_DL/GGML_BACKEND_DIR settings. Those reach
+    // llama.cpp's own compilation regardless: ggml's CMake marks both PUBLIC on the
+    // exported `ggml` target, so `find_package(ggml)` propagates them. Defining them again
+    // here would only create a second, empty backends directory.
+    if cfg!(feature = "dynamic-backends") && !cfg!(feature = "system-ggml") {
         // Pre-create the backends directory so CMake can install MODULE libs there.
         // GGML_BACKEND_DIR causes backends to install to this known path instead of
         // CMAKE_INSTALL_BINDIR, making them easy to locate in downstream build scripts.
@@ -1046,7 +1051,27 @@ fn main() {
     let build_dir = config.build();
 
     if cfg!(feature = "dynamic-backends") {
-        println!("cargo:backends_dir={}", out_dir.join("backends").display());
+        // Re-export whichever build actually produced the modules, so downstream crates
+        // get one answer for "where are the backends" no matter which ggml built them.
+        let backends_dir = if cfg!(feature = "system-ggml") {
+            env::var("DEP_GGML_BACKENDS_DIR").map(PathBuf::from).expect(
+                "system-ggml + dynamic-backends requires ggml-sys to be built with its \
+                 `dynamic-backends` feature, which exports DEP_GGML_BACKENDS_DIR",
+            )
+        } else {
+            out_dir.join("backends")
+        };
+        println!("cargo:backends_dir={}", backends_dir.display());
+    }
+
+    // Re-export where libggml itself lives. Under `system-ggml` it is built by ggml-sys and
+    // installed outside this crate's OUT_DIR, so a consumer that only knows this crate's
+    // root cannot find it. libggml/libggml-base stay ordinary link-time dependencies even
+    // with dynamic backends, so a spawned binary still needs this directory on its loader
+    // search path.
+    if let Ok(ggml_lib) = env::var("DEP_GGML_LIB") {
+        println!("cargo:rerun-if-env-changed=DEP_GGML_LIB");
+        println!("cargo:ggml_lib={ggml_lib}");
     }
 
     // Historical reference: before switching to the upstream CMake tools build for MTMD,
@@ -1297,7 +1322,13 @@ fn main() {
     if cfg!(feature = "system-ggml") {
         println!("cargo:rustc-link-lib={llama_libs_kind}=ggml");
         println!("cargo:rustc-link-lib={llama_libs_kind}=ggml-base");
-        println!("cargo:rustc-link-lib={llama_libs_kind}=ggml-cpu");
+        // With dynamic backends the CPU backend is a `dlopen`ed module built per
+        // instruction-set variant (`libggml-cpu-haswell`, …), so there is no plain
+        // `libggml-cpu` to link and nothing should try: linking a backend is exactly what
+        // makes the binary refuse to start when its runtime is unavailable.
+        if !cfg!(feature = "dynamic-backends") {
+            println!("cargo:rustc-link-lib={llama_libs_kind}=ggml-cpu");
+        }
     }
     for lib in llama_libs {
         let link = format!("cargo:rustc-link-lib={}={}", llama_libs_kind, lib);

@@ -301,14 +301,15 @@ extern "C" void llama_rs_memory_breakdown_print(const struct llama_context * ctx
     common_memory_breakdown_print(ctx);
 }
 
-extern "C" llama_rs_status llama_rs_get_memory_breakdown(
-    const struct llama_context * ctx,
+static llama_rs_status llama_rs_collect_memory_breakdown(
+    const struct llama_model * model,
+    const llama_memory_breakdown & memory_breakdown,
     struct llama_rs_memory_usage * out_host,
     struct llama_rs_memory_usage * out_unattributed,
     struct llama_rs_device_memory_usage * out_devices,
     size_t device_capacity,
     size_t * out_device_count) {
-    if (!ctx || !out_host || !out_unattributed || !out_device_count ||
+    if (!model || !out_host || !out_unattributed || !out_device_count ||
         (!out_devices && device_capacity != 0)) {
         return LLAMA_RS_STATUS_INVALID_ARGUMENT;
     }
@@ -317,64 +318,129 @@ extern "C" llama_rs_status llama_rs_get_memory_breakdown(
     *out_unattributed = {};
     *out_device_count = 0;
 
-    try {
-        const auto * model = llama_get_model(ctx);
-        if (!model) {
-            return LLAMA_RS_STATUS_INVALID_ARGUMENT;
+    const int32_t signed_device_count = llama_model_n_devices(model);
+    if (signed_device_count < 0) {
+        return LLAMA_RS_STATUS_EXCEPTION;
+    }
+    const size_t device_count = static_cast<size_t>(signed_device_count);
+    *out_device_count = device_count;
+
+    if (!out_devices) {
+        return LLAMA_RS_STATUS_OK;
+    }
+    if (device_capacity < device_count) {
+        return LLAMA_RS_STATUS_INVALID_ARGUMENT;
+    }
+
+    for (size_t i = 0; i < device_count; ++i) {
+        out_devices[i] = {};
+        out_devices[i].device_index = i;
+    }
+
+    const auto add_usage = [](
+        struct llama_rs_memory_usage & destination,
+        const llama_memory_breakdown_data & source) {
+        destination.model_bytes += source.model;
+        destination.context_bytes += source.context;
+        destination.compute_bytes += source.compute;
+    };
+
+    for (const auto & [buffer_type, usage] : memory_breakdown) {
+        if (ggml_backend_buft_is_host(buffer_type)) {
+            add_usage(*out_host, usage);
+            continue;
         }
 
-        const int32_t signed_device_count = llama_model_n_devices(model);
-        if (signed_device_count < 0) {
-            return LLAMA_RS_STATUS_EXCEPTION;
-        }
-        const size_t device_count = static_cast<size_t>(signed_device_count);
-        *out_device_count = device_count;
-
-        if (!out_devices) {
-            return LLAMA_RS_STATUS_OK;
-        }
-        if (device_capacity < device_count) {
-            return LLAMA_RS_STATUS_INVALID_ARGUMENT;
-        }
-
-        for (size_t i = 0; i < device_count; ++i) {
-            out_devices[i] = {};
-            out_devices[i].device_index = i;
-        }
-
-        const auto add_usage = [](
-            struct llama_rs_memory_usage & destination,
-            const llama_memory_breakdown_data & source) {
-            destination.model_bytes += source.model;
-            destination.context_bytes += source.context;
-            destination.compute_bytes += source.compute;
-        };
-
-        const llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
-        for (const auto & [buffer_type, usage] : memory_breakdown) {
-            if (ggml_backend_buft_is_host(buffer_type)) {
-                add_usage(*out_host, usage);
-                continue;
-            }
-
-            const ggml_backend_dev_t device = ggml_backend_buft_get_device(buffer_type);
-            bool matched_device = false;
-            if (device) {
-                for (size_t i = 0; i < device_count; ++i) {
-                    if (device == llama_model_get_device(model, static_cast<int>(i))) {
-                        add_usage(out_devices[i].usage, usage);
-                        matched_device = true;
-                        break;
-                    }
+        const ggml_backend_dev_t device = ggml_backend_buft_get_device(buffer_type);
+        bool matched_device = false;
+        if (device) {
+            for (size_t i = 0; i < device_count; ++i) {
+                if (device == llama_model_get_device(model, static_cast<int>(i))) {
+                    add_usage(out_devices[i].usage, usage);
+                    matched_device = true;
+                    break;
                 }
             }
-
-            if (!matched_device) {
-                add_usage(*out_unattributed, usage);
-            }
         }
 
-        return LLAMA_RS_STATUS_OK;
+        if (!matched_device) {
+            add_usage(*out_unattributed, usage);
+        }
+    }
+
+    return LLAMA_RS_STATUS_OK;
+}
+
+extern "C" llama_rs_status llama_rs_get_memory_breakdown(
+    const struct llama_context * ctx,
+    struct llama_rs_memory_usage * out_host,
+    struct llama_rs_memory_usage * out_unattributed,
+    struct llama_rs_device_memory_usage * out_devices,
+    size_t device_capacity,
+    size_t * out_device_count) {
+    if (!ctx) {
+        return LLAMA_RS_STATUS_INVALID_ARGUMENT;
+    }
+
+    try {
+        const auto * model = llama_get_model(ctx);
+        const llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
+        return llama_rs_collect_memory_breakdown(
+            model,
+            memory_breakdown,
+            out_host,
+            out_unattributed,
+            out_devices,
+            device_capacity,
+            out_device_count);
+    } catch (const std::exception &) {
+        return LLAMA_RS_STATUS_EXCEPTION;
+    } catch (...) {
+        return LLAMA_RS_STATUS_EXCEPTION;
+    }
+}
+
+extern "C" llama_rs_status llama_rs_estimate_memory_breakdown(
+    const char * model_path,
+    const struct llama_model_params * model_params,
+    const struct llama_context_params * context_params,
+    struct llama_rs_memory_usage * out_host,
+    struct llama_rs_memory_usage * out_unattributed,
+    struct llama_rs_device_memory_usage * out_devices,
+    size_t device_capacity,
+    size_t * out_device_count) {
+    if (!model_path || !model_params || !context_params) {
+        return LLAMA_RS_STATUS_INVALID_ARGUMENT;
+    }
+
+    try {
+        llama_model_params projected_model_params = *model_params;
+        projected_model_params.no_alloc = true;
+        projected_model_params.load_mode = LLAMA_LOAD_MODE_NONE;
+
+        std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
+            llama_model_load_from_file(model_path, projected_model_params),
+            llama_model_free);
+        if (!model) {
+            return LLAMA_RS_STATUS_EXCEPTION;
+        }
+
+        std::unique_ptr<llama_context, decltype(&llama_free)> context(
+            llama_init_from_model(model.get(), *context_params),
+            llama_free);
+        if (!context) {
+            return LLAMA_RS_STATUS_EXCEPTION;
+        }
+
+        const llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(context.get());
+        return llama_rs_collect_memory_breakdown(
+            model.get(),
+            memory_breakdown,
+            out_host,
+            out_unattributed,
+            out_devices,
+            device_capacity,
+            out_device_count);
     } catch (const std::exception &) {
         return LLAMA_RS_STATUS_EXCEPTION;
     } catch (...) {
