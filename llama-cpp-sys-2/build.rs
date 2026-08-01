@@ -1330,6 +1330,17 @@ fn main() {
             println!("cargo:rustc-link-lib={llama_libs_kind}=ggml-cpu");
         }
     }
+    // Drop llama.cpp's tool implementations — batched-bench, bench, completion, fit-params,
+    // perplexity, quantize. They are built because mtmd lives under `llama.cpp/tools`, so
+    // `LLAMA_BUILD_TOOLS` has to be ON to get it and produces the whole set alongside it, but no
+    // binding here calls into them.
+    //
+    // Linking them is not free: each becomes an `@rpath` dependency of every consumer, so a macOS
+    // bundle either ships six libraries nothing uses or refuses to start when they are absent, and
+    // a consumer that resolves its libraries through an injected loader path needs the build tree
+    // to still exist for libraries it never calls.
+    llama_libs.retain(|lib| !lib.ends_with("-impl"));
+
     for lib in llama_libs {
         let link = format!("cargo:rustc-link-lib={}={}", llama_libs_kind, lib);
         debug_log!("LINK {link}",);
