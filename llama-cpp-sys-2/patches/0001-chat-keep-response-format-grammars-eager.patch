@@ -1,0 +1,48 @@
+From: Airtype downstream
+Subject: [PATCH] chat : keep response-format grammars eager in qwen3-coder and deepseek
+
+The Qwen3-Coder parser (also used by Qwen3.5, Nemotron Nano 3, and Granite 4.2) and the
+DeepSeek parser mark their grammar lazy whenever tools are present without a required tool
+choice, even when a response format constrains the whole reply. A lazy grammar keeps only the
+rules reachable from tool-call triggers, so the response-format root comes out empty:
+
+    root ::=
+    space ::= | " " | "\n"{1,2} [ \t]{0,20}
+
+and llama_sampler_init_grammar rejects it ("expecting newline or end at ::= ..."). Every
+request with tools plus response_format and automatic tool choice fails. The generic
+autoparser and the other specialized parsers already guard laziness with
+!has_response_format; this applies the same condition here.
+
+Upstream report: not yet filed.
+
+Validated against llama.cpp b11201 on an NVIDIA GeForce RTX 5060 Ti (CUDA 13.3): the
+airtype-desktop-inference-sidecar tools_plus_structured_output_can_still_return_schema_json
+suites fail on Qwen3.5 4B and Granite 4.2 3B without the patch and pass with it.
+
+diff --git a/common/parsers/deepseek.cpp b/common/parsers/deepseek.cpp
+index 9ca4bb3..1f23331 100644
+--- a/common/parsers/deepseek.cpp
++++ b/common/parsers/deepseek.cpp
+@@ -259,7 +259,7 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
+     data.parser = parser.save();
+ 
+     if (include_grammar) {
+-        data.grammar_lazy = has_tools && !require_tools;
++        data.grammar_lazy = !has_response_format && has_tools && !require_tools;
+         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+             parser.build_grammar(builder, data.grammar_lazy);
+         });
+diff --git a/common/parsers/qwen3-coder.cpp b/common/parsers/qwen3-coder.cpp
+index 208f551..62b29b4 100644
+--- a/common/parsers/qwen3-coder.cpp
++++ b/common/parsers/qwen3-coder.cpp
+@@ -177,7 +177,7 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
+     data.parser = parser.save();
+ 
+     if (include_grammar) {
+-        data.grammar_lazy = has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
++        data.grammar_lazy = !has_response_format && has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
+ 
+         data.grammar = build_grammar([&](const common_grammar_builder & builder) {
+             parser.build_grammar(builder, data.grammar_lazy);
