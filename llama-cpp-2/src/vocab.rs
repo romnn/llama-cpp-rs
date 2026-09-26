@@ -317,7 +317,8 @@ impl<'model> LlamaVocab<'model> {
         remove_special: bool,
         unparse_special: bool,
     ) -> Vec<u8> {
-        let tokens_estimation = std::cmp::max(8, (tokens.len() * 2) - usize::from(remove_special));
+        let tokens_estimation =
+            std::cmp::max(8, (tokens.len() * 2).saturating_sub(usize::from(remove_special)));
         let mut output = Vec::with_capacity(tokens_estimation);
         self.detokenize_into(tokens, &mut output, remove_special, unparse_special);
         output
