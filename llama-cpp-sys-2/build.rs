@@ -352,6 +352,147 @@ fn is_hidden(e: &DirEntry) -> bool {
         .unwrap_or_default()
 }
 
+/// Top-level llama.cpp entries the build never reads: test vocabularies, documentation, and
+/// media. Leaving them out keeps the patched copy small.
+const UNBUILT_LLAMA_ENTRIES: [&str; 3] = ["models", "docs", "media"];
+
+fn is_built_llama_entry(pristine: &Path, entry: &walkdir::DirEntry) -> bool {
+    if is_hidden(entry) {
+        return false;
+    }
+    let top_level = entry.path().parent() == Some(pristine);
+    !(top_level
+        && entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| UNBUILT_LLAMA_ENTRIES.contains(&name)))
+}
+
+/// Returns the llama.cpp tree for CMake to compile: the pristine submodule when `patches/` holds
+/// no patches, otherwise a copy in `OUT_DIR` with every `patches/*.patch` applied in file-name
+/// order. Patches may change sources but not headers.
+///
+/// The submodule itself is never modified, so upstream bumps stay plain pointer moves. The copy
+/// is reused while a stamp of every source file's size and modification time plus the patch
+/// contents is unchanged, and copied files keep their modification times, so CMake's incremental
+/// build recompiles only what a patch touched.
+fn prepare_llama_src(pristine: &Path, patches_dir: &Path, out_dir: &Path) -> PathBuf {
+    println!("cargo:rerun-if-changed={}", patches_dir.display());
+    let mut patches: Vec<PathBuf> = std::fs::read_dir(patches_dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "patch"))
+                .collect()
+        })
+        .unwrap_or_default();
+    if patches.is_empty() {
+        return pristine.to_path_buf();
+    }
+    patches.sort();
+
+    let mut stamp = String::new();
+    for patch in &patches {
+        let contents = std::fs::read_to_string(patch)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", patch.display()));
+        // Bindgen and the wrapper shims compile against the pristine headers, so a header
+        // change would reach only half the build and split the ABI.
+        if let Some(header) = contents.lines().find_map(|line| {
+            line.strip_prefix("+++ b/")
+                .filter(|path| path.ends_with(".h") || path.ends_with(".hpp"))
+        }) {
+            panic!(
+                "{} modifies the header {header}; llama.cpp patches may change sources only",
+                patch.display()
+            );
+        }
+        stamp.push_str(&format!("patch {}\n{contents}\n", patch.display()));
+    }
+    let source_files: Vec<walkdir::DirEntry> = walkdir::WalkDir::new(pristine)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| is_built_llama_entry(pristine, entry))
+        .map(|entry| entry.expect("failed to walk the llama.cpp sources"))
+        .filter(|entry| entry.file_type().is_file())
+        .collect();
+    for entry in &source_files {
+        let metadata = entry.metadata().expect("failed to stat a llama.cpp source");
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |since| since.as_nanos());
+        stamp.push_str(&format!(
+            "{} {} {modified}\n",
+            entry.path().display(),
+            metadata.len()
+        ));
+    }
+
+    let dest = out_dir.join("llama.cpp-patched");
+    let stamp_path = out_dir.join("llama.cpp-patched.stamp");
+    if dest.is_dir() && std::fs::read_to_string(&stamp_path).is_ok_and(|recorded| recorded == stamp) {
+        return dest;
+    }
+
+    if dest.exists() {
+        std::fs::remove_dir_all(&dest)
+            .unwrap_or_else(|err| panic!("failed to clear {}: {err}", dest.display()));
+    }
+    for entry in &source_files {
+        let relative = entry
+            .path()
+            .strip_prefix(pristine)
+            .expect("walked entries lie under the llama.cpp root");
+        let target = dest.join(relative);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .unwrap_or_else(|err| panic!("failed to create {}: {err}", parent.display()));
+        }
+        std::fs::copy(entry.path(), &target)
+            .unwrap_or_else(|err| panic!("failed to copy {}: {err}", entry.path().display()));
+        let modified = std::fs::metadata(entry.path())
+            .and_then(|metadata| metadata.modified())
+            .expect("failed to read a llama.cpp source modification time");
+        std::fs::File::options()
+            .write(true)
+            .open(&target)
+            .and_then(|file| file.set_modified(modified))
+            .unwrap_or_else(|err| panic!("failed to keep the mtime of {}: {err}", target.display()));
+    }
+
+    // Inside `target/`, `git apply` would otherwise resolve paths against the enclosing
+    // repository; an empty repository roots them here and keeps llama.cpp's build-info lookup
+    // from reporting that repository's commit.
+    run_git(&dest, &["init", "--quiet"]);
+    for patch in &patches {
+        run_git(
+            &dest,
+            &["apply", "--whitespace=nowarn", &patch.display().to_string()],
+        );
+    }
+
+    std::fs::write(&stamp_path, stamp)
+        .unwrap_or_else(|err| panic!("failed to write {}: {err}", stamp_path.display()));
+    dest
+}
+
+fn run_git(dir: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .status()
+        .unwrap_or_else(|err| panic!("failed to run git {args:?}: {err}"));
+    if !status.success() {
+        panic!(
+            "git {args:?} failed in {}: a patch in patches/ no longer applies to the pinned \
+             llama.cpp; refresh it against the new pin, or delete it if upstream fixed the issue",
+            dir.display()
+        );
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
@@ -416,6 +557,11 @@ fn main() {
             println!("cargo:rerun-if-changed={}", entry.path().display());
         }
     }
+
+    // Only CMake compiles the patched tree. Bindgen and the wrapper shims read the pristine
+    // headers, which patches may not change.
+    let llama_build_src =
+        prepare_llama_src(&llama_src, &Path::new(&manifest_dir).join("patches"), &out_dir);
 
     // Use all available cores except 2 to
     let cmake_build_parallelism_level =
@@ -625,7 +771,7 @@ fn main() {
 
     // Build with Cmake
 
-    let mut config = Config::new(&llama_src);
+    let mut config = Config::new(&llama_build_src);
 
     // Would require extra source files to pointlessly
     // be included in what's uploaded to and downloaded from
