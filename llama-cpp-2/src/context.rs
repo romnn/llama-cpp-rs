@@ -85,7 +85,7 @@ impl<'model> LlamaContext<'model> {
     ) -> Self {
         Self {
             context: llama_context,
-            model: llama_model,
+            model: LlamaContextModel::Borrowed(llama_model),
             initialized_logits: Vec::new(),
             embeddings_enabled,
             _backend_samplers: backend_samplers,
@@ -102,6 +102,7 @@ impl<'model> LlamaContext<'model> {
             model: LlamaContextModel::Owned(llama_model),
             initialized_logits: Vec::new(),
             embeddings_enabled,
+            _backend_samplers: Vec::new(),
         }
     }
 

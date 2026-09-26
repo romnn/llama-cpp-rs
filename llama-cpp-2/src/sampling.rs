@@ -429,10 +429,10 @@ impl LlamaSampler {
 
     /// Limits the number of tokens generated inside each reasoning block.
     ///
-    /// The sampler watches `start_tokens` and `end_tokens`. Once a start sequence is accepted, it
-    /// allows at most `budget` further reasoning tokens before forcing `forced_tokens`. The forced
-    /// sequence should contain any budget-exhaustion message followed by the complete reasoning end
-    /// marker.
+    /// The sampler watches `start_tokens` and every sequence in `end_sequences`. Once the start
+    /// sequence is accepted, it allows at most `budget` further reasoning tokens before forcing
+    /// `forced_tokens`; any end sequence closes the block naturally. The forced sequence should
+    /// contain any budget-exhaustion message followed by a complete reasoning end marker.
     ///
     /// Template-provided generation prompt tokens must be accepted by this sampler before
     /// generation starts. This lets a prompt ending in an opening reasoning marker activate the
@@ -441,27 +441,33 @@ impl LlamaSampler {
     ///
     /// # Errors
     ///
-    /// Returns [`ReasoningBudgetError`] when a required token sequence is empty, the budget exceeds
+    /// Returns [`ReasoningBudgetError`] when a required token sequence or the list of end
+    /// sequences is empty, the budget exceeds
     /// llama.cpp's signed range, or llama.cpp cannot allocate the sampler.
     #[cfg(feature = "common")]
     pub fn reasoning_budget(
         model: &LlamaModel,
         start_tokens: &[LlamaToken],
-        end_tokens: &[LlamaToken],
+        end_sequences: &[&[LlamaToken]],
         forced_tokens: &[LlamaToken],
         budget: u32,
     ) -> Result<Self, ReasoningBudgetError> {
         let budget =
-            validate_reasoning_budget_inputs(start_tokens, end_tokens, forced_tokens, budget)?;
+            validate_reasoning_budget_inputs(start_tokens, end_sequences, forced_tokens, budget)?;
+        // The wrapper takes the end sequences concatenated and delimited by their lengths.
+        let end_tokens: Vec<LlamaToken> = end_sequences.concat();
+        let end_sequence_lengths: Vec<usize> =
+            end_sequences.iter().map(|sequence| sequence.len()).collect();
         // SAFETY: The model owns a live vocabulary, and each non-empty slice remains valid for the
         // duration of the call. The wrapper copies every token before returning.
         let sampler = unsafe {
             llama_cpp_sys_2::llama_rs_sampler_init_reasoning_budget(
-                model.vocab_ptr(),
+                model.vocab().as_ptr(),
                 start_tokens.as_ptr().cast(),
                 start_tokens.len(),
                 end_tokens.as_ptr().cast(),
-                end_tokens.len(),
+                end_sequence_lengths.as_ptr(),
+                end_sequence_lengths.len(),
                 forced_tokens.as_ptr().cast(),
                 forced_tokens.len(),
                 budget,
@@ -706,14 +712,14 @@ impl LlamaSampler {
 #[cfg(feature = "common")]
 fn validate_reasoning_budget_inputs(
     start_tokens: &[LlamaToken],
-    end_tokens: &[LlamaToken],
+    end_sequences: &[&[LlamaToken]],
     forced_tokens: &[LlamaToken],
     budget: u32,
 ) -> Result<i32, ReasoningBudgetError> {
     if start_tokens.is_empty() {
         return Err(ReasoningBudgetError::EmptyStartTokens);
     }
-    if end_tokens.is_empty() {
+    if end_sequences.is_empty() || end_sequences.iter().any(|sequence| sequence.is_empty()) {
         return Err(ReasoningBudgetError::EmptyEndTokens);
     }
     if forced_tokens.is_empty() {
@@ -731,17 +737,23 @@ mod tests {
     #[test]
     fn reasoning_budget_rejects_missing_token_sequences() {
         let token = [LlamaToken::new(1)];
+        let end_sequences: [&[LlamaToken]; 1] = [&token];
 
         assert_eq!(
-            validate_reasoning_budget_inputs(&[], &token, &token, 1),
+            validate_reasoning_budget_inputs(&[], &end_sequences, &token, 1),
             Err(ReasoningBudgetError::EmptyStartTokens)
         );
         assert_eq!(
             validate_reasoning_budget_inputs(&token, &[], &token, 1),
             Err(ReasoningBudgetError::EmptyEndTokens)
         );
+        // One empty sequence among several is rejected rather than matching every position.
         assert_eq!(
-            validate_reasoning_budget_inputs(&token, &token, &[], 1),
+            validate_reasoning_budget_inputs(&token, &[&token, &[]], &token, 1),
+            Err(ReasoningBudgetError::EmptyEndTokens)
+        );
+        assert_eq!(
+            validate_reasoning_budget_inputs(&token, &end_sequences, &[], 1),
             Err(ReasoningBudgetError::EmptyForcedTokens)
         );
     }
@@ -752,7 +764,7 @@ mod tests {
         let budget = u32::MAX;
 
         assert_eq!(
-            validate_reasoning_budget_inputs(&token, &token, &token, budget),
+            validate_reasoning_budget_inputs(&token, &[&token], &token, budget),
             Err(ReasoningBudgetError::BudgetTooLarge(budget))
         );
     }

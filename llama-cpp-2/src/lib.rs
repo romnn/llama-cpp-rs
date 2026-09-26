@@ -435,7 +435,7 @@ pub enum ReasoningBudgetError {
     /// The opening reasoning marker did not produce any tokens.
     #[error("reasoning start tokens are empty")]
     EmptyStartTokens,
-    /// The closing reasoning marker did not produce any tokens.
+    /// No closing reasoning marker was given, or one of them did not produce any tokens.
     #[error("reasoning end tokens are empty")]
     EmptyEndTokens,
     /// The sequence forced when the budget expires did not produce any tokens.

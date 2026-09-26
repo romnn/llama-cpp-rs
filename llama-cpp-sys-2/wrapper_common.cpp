@@ -112,8 +112,11 @@ extern "C" void llama_rs_chat_template_result_free(struct llama_rs_chat_template
     if (result->thinking_start_tag) {
         std::free(result->thinking_start_tag);
     }
-    if (result->thinking_end_tag) {
-        std::free(result->thinking_end_tag);
+    if (result->thinking_end_tags) {
+        for (size_t i = 0; i < result->thinking_end_tags_count; ++i) {
+            std::free(result->thinking_end_tags[i]);
+        }
+        std::free(result->thinking_end_tags);
     }
     if (result->grammar_triggers) {
         for (size_t i = 0; i < result->grammar_triggers_count; ++i) {
@@ -138,7 +141,8 @@ extern "C" void llama_rs_chat_template_result_free(struct llama_rs_chat_template
     result->parser = nullptr;
     result->generation_prompt = nullptr;
     result->thinking_start_tag = nullptr;
-    result->thinking_end_tag = nullptr;
+    result->thinking_end_tags = nullptr;
+    result->thinking_end_tags_count = 0;
     result->supports_thinking = false;
     result->chat_format = 0;
     result->grammar_lazy = false;
@@ -155,7 +159,8 @@ extern "C" struct llama_sampler * llama_rs_sampler_init_reasoning_budget(
     const llama_token * start_tokens,
     size_t start_tokens_count,
     const llama_token * end_tokens,
-    size_t end_tokens_count,
+    const size_t * end_sequence_lengths,
+    size_t end_sequences_count,
     const llama_token * forced_tokens,
     size_t forced_tokens_count,
     int32_t budget) {
@@ -163,7 +168,8 @@ extern "C" struct llama_sampler * llama_rs_sampler_init_reasoning_budget(
         || !start_tokens
         || start_tokens_count == 0
         || !end_tokens
-        || end_tokens_count == 0
+        || !end_sequence_lengths
+        || end_sequences_count == 0
         || !forced_tokens
         || forced_tokens_count == 0
         || budget < 0) {
@@ -171,13 +177,24 @@ extern "C" struct llama_sampler * llama_rs_sampler_init_reasoning_budget(
     }
 
     try {
-        const std::vector<llama_token> start(start_tokens, start_tokens + start_tokens_count);
-        const std::vector<llama_token> end(end_tokens, end_tokens + end_tokens_count);
-        const std::vector<llama_token> forced(forced_tokens, forced_tokens + forced_tokens_count);
+        const std::vector<llama_tokens> starts = {
+            llama_tokens(start_tokens, start_tokens + start_tokens_count)};
+        // End sequences arrive concatenated, delimited by their lengths.
+        std::vector<llama_tokens> ends;
+        ends.reserve(end_sequences_count);
+        const llama_token * cursor = end_tokens;
+        for (size_t i = 0; i < end_sequences_count; ++i) {
+            if (end_sequence_lengths[i] == 0) {
+                return nullptr;
+            }
+            ends.emplace_back(cursor, cursor + end_sequence_lengths[i]);
+            cursor += end_sequence_lengths[i];
+        }
+        const llama_tokens forced(forced_tokens, forced_tokens + forced_tokens_count);
         return common_reasoning_budget_init(
             vocab,
-            start,
-            end,
+            starts,
+            ends,
             forced,
             budget,
             REASONING_BUDGET_IDLE);

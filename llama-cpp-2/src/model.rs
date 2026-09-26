@@ -3,7 +3,8 @@ use std::ffi::{c_char, CStr, CString};
 use std::mem;
 use std::os::raw::c_int;
 use std::path::Path;
-use std::ptr::NonNull;
+use std::ptr::{self, NonNull};
+use std::slice;
 use std::str::Utf8Error;
 use std::string::FromUtf8Error;
 use std::sync::Arc;
@@ -144,8 +145,12 @@ pub struct ChatTemplateResult {
     pub generation_prompt: String,
     /// Marker that opens a reasoning block when the template supports thinking.
     pub thinking_start_tag: Option<String>,
-    /// Marker that closes a reasoning block when the template supports thinking.
-    pub thinking_end_tag: Option<String>,
+    /// Markers that close a reasoning block when the template supports thinking.
+    ///
+    /// Some templates end reasoning in several ways, for example with a closing tag or by opening
+    /// a tool call directly. The first marker is the canonical one to emit when forcing a
+    /// reasoning block closed.
+    pub thinking_end_tags: Vec<String>,
     /// Whether this rendered template supports generated reasoning content.
     pub supports_thinking: bool,
     /// Whether tool calls should be parsed from the response.
@@ -707,7 +712,8 @@ impl LlamaModel {
             parser: ptr::null_mut(),
             generation_prompt: ptr::null_mut(),
             thinking_start_tag: ptr::null_mut(),
-            thinking_end_tag: ptr::null_mut(),
+            thinking_end_tags: ptr::null_mut(),
+            thinking_end_tags_count: 0,
             supports_thinking: false,
             chat_format: 0,
             grammar_lazy: false,
@@ -778,7 +784,10 @@ impl LlamaModel {
                 String::from_utf8(generation_prompt_bytes)?
             };
             let thinking_start_tag = optional_ffi_string(raw_result.thinking_start_tag)?;
-            let thinking_end_tag = optional_ffi_string(raw_result.thinking_end_tag)?;
+            let thinking_end_tags = ffi_string_array(
+                raw_result.thinking_end_tags,
+                raw_result.thinking_end_tags_count,
+            )?;
             let grammar_triggers = if raw_result.grammar_triggers_count == 0 {
                 Vec::new()
             } else if raw_result.grammar_triggers.is_null() {
@@ -818,48 +827,10 @@ impl LlamaModel {
                 }
                 parsed
             };
-            let preserved_tokens = if raw_result.preserved_tokens_count == 0 {
-                Vec::new()
-            } else if raw_result.preserved_tokens.is_null() {
-                return Err(ApplyChatTemplateError::InvalidGrammarTriggerType);
-            } else {
-                let tokens = unsafe {
-                    slice::from_raw_parts(
-                        raw_result.preserved_tokens,
-                        raw_result.preserved_tokens_count,
-                    )
-                };
-                let mut parsed = Vec::with_capacity(tokens.len());
-                for token in tokens {
-                    if token.is_null() {
-                        return Err(ApplyChatTemplateError::InvalidGrammarTriggerType);
-                    }
-                    let bytes = unsafe { CStr::from_ptr(*token) }.to_bytes().to_vec();
-                    parsed.push(String::from_utf8(bytes)?);
-                }
-                parsed
-            };
-            let additional_stops = if raw_result.additional_stops_count == 0 {
-                Vec::new()
-            } else if raw_result.additional_stops.is_null() {
-                return Err(ApplyChatTemplateError::InvalidGrammarTriggerType);
-            } else {
-                let stops = unsafe {
-                    slice::from_raw_parts(
-                        raw_result.additional_stops,
-                        raw_result.additional_stops_count,
-                    )
-                };
-                let mut parsed = Vec::with_capacity(stops.len());
-                for stop in stops {
-                    if stop.is_null() {
-                        return Err(ApplyChatTemplateError::InvalidGrammarTriggerType);
-                    }
-                    let bytes = unsafe { CStr::from_ptr(*stop) }.to_bytes().to_vec();
-                    parsed.push(String::from_utf8(bytes)?);
-                }
-                parsed
-            };
+            let preserved_tokens =
+                ffi_string_array(raw_result.preserved_tokens, raw_result.preserved_tokens_count)?;
+            let additional_stops =
+                ffi_string_array(raw_result.additional_stops, raw_result.additional_stops_count)?;
             let parse_tool_calls = tools_json.is_some_and(|tools| !tools.is_empty());
             Ok(ChatTemplateResult {
                 prompt,
@@ -872,7 +843,7 @@ impl LlamaModel {
                 parser,
                 generation_prompt,
                 thinking_start_tag,
-                thinking_end_tag,
+                thinking_end_tags,
                 supports_thinking: raw_result.supports_thinking,
                 parse_tool_calls,
             })
@@ -904,7 +875,8 @@ impl LlamaModel {
             parser: ptr::null_mut(),
             generation_prompt: ptr::null_mut(),
             thinking_start_tag: ptr::null_mut(),
-            thinking_end_tag: ptr::null_mut(),
+            thinking_end_tags: ptr::null_mut(),
+            thinking_end_tags_count: 0,
             supports_thinking: false,
             chat_format: 0,
             grammar_lazy: false,
@@ -991,7 +963,10 @@ impl LlamaModel {
                 String::from_utf8(generation_prompt_bytes)?
             };
             let thinking_start_tag = optional_ffi_string(raw_result.thinking_start_tag)?;
-            let thinking_end_tag = optional_ffi_string(raw_result.thinking_end_tag)?;
+            let thinking_end_tags = ffi_string_array(
+                raw_result.thinking_end_tags,
+                raw_result.thinking_end_tags_count,
+            )?;
             let grammar_triggers = if raw_result.grammar_triggers_count == 0 {
                 Vec::new()
             } else if raw_result.grammar_triggers.is_null() {
@@ -1031,48 +1006,10 @@ impl LlamaModel {
                 }
                 parsed
             };
-            let preserved_tokens = if raw_result.preserved_tokens_count == 0 {
-                Vec::new()
-            } else if raw_result.preserved_tokens.is_null() {
-                return Err(ApplyChatTemplateError::InvalidGrammarTriggerType);
-            } else {
-                let tokens = unsafe {
-                    slice::from_raw_parts(
-                        raw_result.preserved_tokens,
-                        raw_result.preserved_tokens_count,
-                    )
-                };
-                let mut parsed = Vec::with_capacity(tokens.len());
-                for token in tokens {
-                    if token.is_null() {
-                        return Err(ApplyChatTemplateError::InvalidGrammarTriggerType);
-                    }
-                    let bytes = unsafe { CStr::from_ptr(*token) }.to_bytes().to_vec();
-                    parsed.push(String::from_utf8(bytes)?);
-                }
-                parsed
-            };
-            let additional_stops = if raw_result.additional_stops_count == 0 {
-                Vec::new()
-            } else if raw_result.additional_stops.is_null() {
-                return Err(ApplyChatTemplateError::InvalidGrammarTriggerType);
-            } else {
-                let stops = unsafe {
-                    slice::from_raw_parts(
-                        raw_result.additional_stops,
-                        raw_result.additional_stops_count,
-                    )
-                };
-                let mut parsed = Vec::with_capacity(stops.len());
-                for stop in stops {
-                    if stop.is_null() {
-                        return Err(ApplyChatTemplateError::InvalidGrammarTriggerType);
-                    }
-                    let bytes = unsafe { CStr::from_ptr(*stop) }.to_bytes().to_vec();
-                    parsed.push(String::from_utf8(bytes)?);
-                }
-                parsed
-            };
+            let preserved_tokens =
+                ffi_string_array(raw_result.preserved_tokens, raw_result.preserved_tokens_count)?;
+            let additional_stops =
+                ffi_string_array(raw_result.additional_stops, raw_result.additional_stops_count)?;
 
             Ok(ChatTemplateResult {
                 prompt,
@@ -1085,7 +1022,7 @@ impl LlamaModel {
                 parser,
                 generation_prompt,
                 thinking_start_tag,
-                thinking_end_tag,
+                thinking_end_tags,
                 supports_thinking: raw_result.supports_thinking,
                 parse_tool_calls,
             })
@@ -1105,6 +1042,33 @@ pub(crate) fn optional_ffi_string(value: *const c_char) -> Result<Option<String>
     // keeps it alive until the matching free call runs after this conversion.
     let bytes = unsafe { CStr::from_ptr(value) }.to_bytes().to_vec();
     Ok(Some(String::from_utf8(bytes)?))
+}
+
+/// Duplicates a wrapper-owned array of C strings into owned Rust strings.
+fn ffi_string_array(
+    values: *const *mut c_char,
+    count: usize,
+) -> Result<Vec<String>, ApplyChatTemplateError> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if values.is_null() {
+        return Err(ApplyChatTemplateError::InvalidGrammarTriggerType);
+    }
+    // SAFETY: The wrapper returns `count` owned string pointers for a non-null array and keeps
+    // them alive until the matching free call runs after this conversion.
+    let values = unsafe { slice::from_raw_parts(values, count) };
+    values
+        .iter()
+        .map(|value| {
+            if value.is_null() {
+                return Err(ApplyChatTemplateError::InvalidGrammarTriggerType);
+            }
+            // SAFETY: Checked non-null above; the wrapper null-terminates every string.
+            let bytes = unsafe { CStr::from_ptr(*value) }.to_bytes().to_vec();
+            Ok(String::from_utf8(bytes)?)
+        })
+        .collect()
 }
 
 impl ChatTemplateResult {

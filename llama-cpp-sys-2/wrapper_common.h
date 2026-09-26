@@ -22,7 +22,8 @@ struct llama_rs_chat_template_result {
     char * parser;
     char * generation_prompt;
     char * thinking_start_tag;
-    char * thinking_end_tag;
+    char ** thinking_end_tags;
+    size_t thinking_end_tags_count;
     bool supports_thinking;
     int chat_format;
     bool grammar_lazy;
@@ -103,8 +104,10 @@ struct llama_sampler * llama_rs_sampler_init_reasoning_budget(
     const struct llama_vocab * vocab,
     const llama_token * start_tokens,
     size_t start_tokens_count,
+    // Every end sequence, concatenated; `end_sequence_lengths` delimits them.
     const llama_token * end_tokens,
-    size_t end_tokens_count,
+    const size_t * end_sequence_lengths,
+    size_t end_sequences_count,
     const llama_token * forced_tokens,
     size_t forced_tokens_count,
     int32_t budget);
