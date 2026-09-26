@@ -374,8 +374,10 @@ fn is_built_llama_entry(pristine: &Path, entry: &walkdir::DirEntry) -> bool {
 ///
 /// The submodule itself is never modified, so upstream bumps stay plain pointer moves. The copy
 /// is reused while a stamp of every source file's size and modification time plus the patch
-/// contents is unchanged, and copied files keep their modification times, so CMake's incremental
-/// build recompiles only what a patch touched.
+/// contents is unchanged. Copied files keep their modification times, so CMake's incremental
+/// build recompiles only what a patch touched, except files that the current or the previous
+/// patch set touches: those get a fresh time, so a file a patch no longer changes is rebuilt from
+/// its pristine contents instead of keeping the object compiled from the patched one.
 fn prepare_llama_src(pristine: &Path, patches_dir: &Path, out_dir: &Path) -> PathBuf {
     println!("cargo:rerun-if-changed={}", patches_dir.display());
     let mut patches: Vec<PathBuf> = std::fs::read_dir(patches_dir)
@@ -393,20 +395,20 @@ fn prepare_llama_src(pristine: &Path, patches_dir: &Path, out_dir: &Path) -> Pat
     patches.sort();
 
     let mut stamp = String::new();
+    let mut patched_paths = std::collections::BTreeSet::new();
     for patch in &patches {
         let contents = std::fs::read_to_string(patch)
             .unwrap_or_else(|err| panic!("failed to read {}: {err}", patch.display()));
+        let paths = patch_paths(&contents);
         // Bindgen and the wrapper shims compile against the pristine headers, so a header
         // change would reach only half the build and split the ABI.
-        if let Some(header) = contents.lines().find_map(|line| {
-            line.strip_prefix("+++ b/")
-                .filter(|path| path.ends_with(".h") || path.ends_with(".hpp"))
-        }) {
+        if let Some(header) = paths.iter().find(|path| is_header(path)) {
             panic!(
-                "{} modifies the header {header}; llama.cpp patches may change sources only",
+                "{} touches the header {header}; llama.cpp patches may change sources only",
                 patch.display()
             );
         }
+        patched_paths.extend(paths);
         stamp.push_str(&format!("patch {}\n{contents}\n", patch.display()));
     }
     let source_files: Vec<walkdir::DirEntry> = walkdir::WalkDir::new(pristine)
@@ -432,8 +434,16 @@ fn prepare_llama_src(pristine: &Path, patches_dir: &Path, out_dir: &Path) -> Pat
 
     let dest = out_dir.join("llama.cpp-patched");
     let stamp_path = out_dir.join("llama.cpp-patched.stamp");
-    if dest.is_dir() && std::fs::read_to_string(&stamp_path).is_ok_and(|recorded| recorded == stamp) {
+    let patched_paths_path = out_dir.join("llama.cpp-patched.paths");
+    if dest.is_dir() && std::fs::read_to_string(&stamp_path).is_ok_and(|recorded| recorded == stamp)
+    {
         return dest;
+    }
+    // Objects compiled from a previously patched file are newer than its pristine time, so that
+    // file must look changed even when no current patch touches it.
+    let mut fresh_paths = patched_paths.clone();
+    if let Ok(previous) = std::fs::read_to_string(&patched_paths_path) {
+        fresh_paths.extend(previous.lines().map(str::to_owned));
     }
 
     if dest.exists() {
@@ -452,6 +462,11 @@ fn prepare_llama_src(pristine: &Path, patches_dir: &Path, out_dir: &Path) -> Pat
         }
         std::fs::copy(entry.path(), &target)
             .unwrap_or_else(|err| panic!("failed to copy {}: {err}", entry.path().display()));
+        // A copy gets the current time, which is what a patched path needs.
+        let relative_path = relative.to_string_lossy().replace('\\', "/");
+        if fresh_paths.contains(&relative_path) {
+            continue;
+        }
         let modified = std::fs::metadata(entry.path())
             .and_then(|metadata| metadata.modified())
             .expect("failed to read a llama.cpp source modification time");
@@ -459,7 +474,9 @@ fn prepare_llama_src(pristine: &Path, patches_dir: &Path, out_dir: &Path) -> Pat
             .write(true)
             .open(&target)
             .and_then(|file| file.set_modified(modified))
-            .unwrap_or_else(|err| panic!("failed to keep the mtime of {}: {err}", target.display()));
+            .unwrap_or_else(|err| {
+                panic!("failed to keep the mtime of {}: {err}", target.display())
+            });
     }
 
     // Inside `target/`, `git apply` would otherwise resolve paths against the enclosing
@@ -473,9 +490,113 @@ fn prepare_llama_src(pristine: &Path, patches_dir: &Path, out_dir: &Path) -> Pat
         );
     }
 
+    let patched_path_list: String = patched_paths
+        .iter()
+        .map(|path| format!("{path}\n"))
+        .collect();
+    std::fs::write(&patched_paths_path, patched_path_list)
+        .unwrap_or_else(|err| panic!("failed to write {}: {err}", patched_paths_path.display()));
     std::fs::write(&stamp_path, stamp)
         .unwrap_or_else(|err| panic!("failed to write {}: {err}", stamp_path.display()));
     dest
+}
+
+/// Returns every repository path a patch reads, writes, creates, deletes, renames, or copies.
+fn patch_paths(contents: &str) -> Vec<String> {
+    const PREFIXES: [&str; 6] = [
+        "--- a/",
+        "+++ b/",
+        "rename from ",
+        "rename to ",
+        "copy from ",
+        "copy to ",
+    ];
+    contents
+        .lines()
+        .filter_map(|line| {
+            PREFIXES
+                .iter()
+                .find_map(|prefix| line.strip_prefix(prefix))
+                .map(|path| path.trim_end().to_owned())
+        })
+        .collect()
+}
+
+fn is_header(path: &str) -> bool {
+    const HEADER_EXTENSIONS: [&str; 6] = ["h", "hh", "hpp", "hxx", "cuh", "inl"];
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| HEADER_EXTENSIONS.contains(&extension))
+}
+
+/// Guards against ggml drift between the linked libggml and the headers bindgen reads.
+///
+/// The linker resolves ggml symbols from `ggml-sys`, but bindgen processes `wrapper.h`, which
+/// includes this submodule's `ggml/include/`. When `ggml-sys` builds ggml from llama.cpp's own
+/// tree it exports that commit as `DEP_GGML_LLAMA_CPP_REV`, and the two must be the same commit,
+/// or the generated Rust types can silently disagree with the linked binary's layout.
+/// `scripts/sync-ggml.last` cannot establish that: it only moves when llama.cpp syncs with
+/// ggml.git, while llama.cpp's `ggml/` tree changes between syncs too.
+fn verify_system_ggml_revision(llama_src: &Path) {
+    if let Ok(expected_rev) = env::var("DEP_GGML_LLAMA_CPP_REV") {
+        match llama_cpp_submodule_rev(llama_src) {
+            Some(actual_rev) if actual_rev == expected_rev => {}
+            Some(actual_rev) => panic!(
+                "ggml drift: ggml-sys builds ggml from llama.cpp {expected_rev}, but this fork's \
+                 llama.cpp submodule is at {actual_rev}. bindgen reads the submodule's ggml \
+                 headers while linking ggml-sys's library, so both must be the same commit: move \
+                 ggml-sys's llama.cpp pin and this submodule together."
+            ),
+            None => println!(
+                "cargo:warning=cannot read the llama.cpp submodule commit in {} to check it \
+                 against ggml-sys's llama.cpp {expected_rev}",
+                llama_src.display()
+            ),
+        }
+        return;
+    }
+
+    // An older ggml-sys built from ggml.git exports only its ggml sync point.
+    let Ok(expected_sync) = env::var("DEP_GGML_GGML_REV") else {
+        return;
+    };
+    let bundled_sync_path = llama_src.join("scripts/sync-ggml.last");
+    let bundled_sync = std::fs::read_to_string(&bundled_sync_path)
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to read {} (needed to verify bundled ggml matches ggml-sys's pin): {err}",
+                bundled_sync_path.display()
+            )
+        })
+        .trim()
+        .to_owned();
+    if bundled_sync != expected_sync {
+        println!(
+            "cargo:warning=ggml SHA drift: ggml-sys is pinned at {expected_sync} but this fork's \
+             bundled llama.cpp/ggml synced from {bundled_sync}. The linked libggml comes from \
+             ggml-sys's SHA, while bindgen reads bundled headers. This is safe only if ggml's C \
+             API is binary-compatible across the drift range."
+        );
+    }
+}
+
+/// Returns the commit the llama.cpp submodule is checked out at, or `None` outside a git
+/// checkout, such as a packaged crate.
+fn llama_cpp_submodule_rev(llama_src: &Path) -> Option<String> {
+    // Without its own `.git`, `git rev-parse` would report an enclosing repository's commit.
+    if !llama_src.join(".git").exists() {
+        return None;
+    }
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(llama_src)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 fn run_git(dir: &Path, args: &[&str]) {
@@ -560,8 +681,11 @@ fn main() {
 
     // Only CMake compiles the patched tree. Bindgen and the wrapper shims read the pristine
     // headers, which patches may not change.
-    let llama_build_src =
-        prepare_llama_src(&llama_src, &Path::new(&manifest_dir).join("patches"), &out_dir);
+    let llama_build_src = prepare_llama_src(
+        &llama_src,
+        &Path::new(&manifest_dir).join("patches"),
+        &out_dir,
+    );
 
     // Use all available cores except 2 to
     let cmake_build_parallelism_level =
@@ -1230,37 +1354,8 @@ fn main() {
         println!("cargo:rerun-if-env-changed=DEP_GGML_INCLUDE");
         println!("cargo:rerun-if-env-changed=DEP_GGML_CMAKE_PREFIX_PATH");
         println!("cargo:rerun-if-env-changed=DEP_GGML_GGML_REV");
-
-        // Compile-time guard against silent ggml drift between the linked libggml
-        // and the bundled headers bindgen reads from. The linker resolves ggml
-        // symbols from `ggml-sys`'s pinned SHA, but bindgen processes wrapper.h
-        // which still points at this fork's bundled `llama.cpp/ggml/include/`
-        // tree. Those two MUST be the same SHA, or the generated Rust types
-        // silently disagree with the linked binary's layout — exactly the kind
-        // of ABI hellscape this whole unification effort is meant to prevent.
-        let bundled_sync = llama_src.join("scripts/sync-ggml.last");
-        let bundled_sha = std::fs::read_to_string(&bundled_sync)
-            .unwrap_or_else(|err| {
-                panic!(
-                    "failed to read {} (needed to verify bundled ggml matches \
-                     ggml-sys's pin): {err}",
-                    bundled_sync.display()
-                )
-            })
-            .trim()
-            .to_owned();
-        if let Ok(expected_sha) = std::env::var("DEP_GGML_GGML_REV") {
-            if bundled_sha != expected_sha {
-                println!(
-                    "cargo:warning=ggml SHA drift: ggml-sys is pinned at {expected_sha} but \
-                     this fork's bundled llama.cpp/ggml synced from {bundled_sha}. The linked \
-                     libggml comes from ggml-sys's SHA, while bindgen reads bundled headers. \
-                     This is safe only if ggml's C API is binary-compatible across the drift \
-                     range. Consider bumping the llama.cpp submodule to a commit whose \
-                     scripts/sync-ggml.last matches ggml-sys's pin."
-                );
-            }
-        }
+        println!("cargo:rerun-if-env-changed=DEP_GGML_LLAMA_CPP_REV");
+        verify_system_ggml_revision(&llama_src);
     }
 
     // With `system-ggml`, ggml is built by the ggml-sys crate rather than here, so it owns
@@ -1501,6 +1596,16 @@ fn main() {
             .iter()
             .map(|lib| lib_name(lib).to_owned())
             .collect();
+
+    // Drop llama.cpp's tool implementations (batched-bench, bench, completion, fit-params,
+    // perplexity, quantize). `LLAMA_BUILD_TOOLS=OFF` stops building them, but an output
+    // directory configured before still has them installed, and no binding here calls into them.
+    //
+    // Linking them is not free: each becomes an `@rpath` dependency of every consumer, so a macOS
+    // bundle either ships six libraries nothing uses or refuses to start when they are absent, and
+    // a consumer that resolves its libraries through an injected loader path needs the build tree
+    // to still exist for libraries it never calls.
+    llama_libs.retain(|lib| !lib.ends_with("-impl"));
 
     assert_ne!(llama_libs.len(), 0);
 
