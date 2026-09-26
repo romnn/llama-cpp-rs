@@ -18,6 +18,8 @@ include = [
     "wrapper_utils.h",
     "build.rs",
     "/src",
+    # Downstream llama.cpp patches, applied to a copy of the tree at build time.
+    "/patches",
 
     # Everything needed for building GGML (CMake, include and src)
     #
