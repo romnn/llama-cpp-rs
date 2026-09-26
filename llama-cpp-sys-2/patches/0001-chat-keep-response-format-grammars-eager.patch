@@ -1,24 +1,30 @@
 From: Airtype downstream
-Subject: [PATCH] chat : keep response-format grammars eager in qwen3-coder and deepseek
+Subject: [PATCH] chat : keep response-format grammars eager in qwen3-coder, deepseek and ministral3
 
-The Qwen3-Coder parser (also used by Qwen3.5, Nemotron Nano 3, and Granite 4.2) and the
-DeepSeek parser mark their grammar lazy whenever tools are present without a required tool
-choice, even when a response format constrains the whole reply. A lazy grammar keeps only the
-rules reachable from tool-call triggers, so the response-format root comes out empty:
+The Qwen3-Coder parser (also used by Qwen3.5, Nemotron Nano 3, and Granite 4.2), the DeepSeek
+parser, and the Ministral 3 parser mark their grammar lazy whenever tools are present without a
+required tool choice, even when a response format constrains the whole reply. Their response-format
+branch contains no tool-call trigger, and a lazy grammar keeps only the rules reachable from
+triggers, so the response-format root comes out empty:
 
     root ::=
     space ::= | " " | "\n"{1,2} [ \t]{0,20}
 
 and llama_sampler_init_grammar rejects it ("expecting newline or end at ::= ..."). Every
 request with tools plus response_format and automatic tool choice fails. The generic
-autoparser and the other specialized parsers already guard laziness with
-!has_response_format; this applies the same condition here.
+autoparser and the other specialized parsers that build a response-format branch (cohere2moe,
+gemma4, gpt-oss, lfm2, minicpm5, minimax-m3) already guard laziness with !has_response_format;
+this applies the same condition here. Parsers that ignore the response format entirely
+(functionary-v3-2, gigachat-v3, kimi-k2, kimi-k3, ling3, muse-glimmer) are a separate gap that
+this patch does not address.
 
 Upstream report: not yet filed.
 
 Validated against llama.cpp b11201 on an NVIDIA GeForce RTX 5060 Ti (CUDA 13.3): the
 airtype-desktop-inference-sidecar tools_plus_structured_output_can_still_return_schema_json
-suites fail on Qwen3.5 4B and Granite 4.2 3B without the patch and pass with it.
+suites fail on Qwen3.5 4B and Granite 4.2 3B without the patch and pass with it. The Ministral 3
+hunk is the identical one-line condition, confirmed by printing the grammar
+common_chat_templates_apply builds for a Ministral 3 template.
 
 diff --git a/common/parsers/deepseek.cpp b/common/parsers/deepseek.cpp
 index 9ca4bb3..1f23331 100644
@@ -33,6 +39,19 @@ index 9ca4bb3..1f23331 100644
          data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
              parser.build_grammar(builder, data.grammar_lazy);
          });
+diff --git a/common/parsers/ministral3.cpp b/common/parsers/ministral3.cpp
+index 8bcd204..a0dad7c 100644
+--- a/common/parsers/ministral3.cpp
++++ b/common/parsers/ministral3.cpp
+@@ -111,7 +111,7 @@ common_chat_params common_chat_params_init_ministral_3(const common_chat_templat
+     data.parser = parser.save();
+ 
+     if (include_grammar) {
+-        data.grammar_lazy = has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
++        data.grammar_lazy = !has_response_format && has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
+ 
+         data.grammar = build_grammar([&](const common_grammar_builder & builder) {
+             parser.build_grammar(builder, data.grammar_lazy);
 diff --git a/common/parsers/qwen3-coder.cpp b/common/parsers/qwen3-coder.cpp
 index 208f551..62b29b4 100644
 --- a/common/parsers/qwen3-coder.cpp
