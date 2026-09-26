@@ -633,10 +633,9 @@ fn main() {
     config.define("LLAMA_BUILD_TESTS", "OFF");
     config.define("LLAMA_BUILD_EXAMPLES", "OFF");
     config.define("LLAMA_BUILD_SERVER", "OFF");
-    config.define(
-        "LLAMA_BUILD_TOOLS",
-        if cfg!(feature = "mtmd") { "ON" } else { "OFF" },
-    );
+    // mtmd comes from `LLAMA_BUILD_MTMD` below, which builds only that library out of
+    // `tools/`; the rest of the tools would only add libraries no binding calls.
+    config.define("LLAMA_BUILD_TOOLS", "OFF");
     // `app` (the unified `llama` binary) defaults to ON when llama.cpp is the
     // top-level CMake project; it pulls in server/tool internals we don't build.
     config.define("LLAMA_BUILD_APP", "OFF");
@@ -1350,7 +1349,12 @@ fn main() {
         "static"
     };
 
-    let mut llama_libs = extract_lib_names(&out_dir.join("lib*"), &target_os, build_shared_libs);
+    // Filter by library name rather than path, which would never equal a bare name.
+    let mut llama_libs: Vec<String> =
+        extract_lib_names(&out_dir.join("lib*"), &target_os, build_shared_libs)
+            .iter()
+            .map(|lib| lib_name(lib).to_owned())
+            .collect();
 
     assert_ne!(llama_libs.len(), 0);
 
@@ -1359,8 +1363,11 @@ fn main() {
         println!("cargo:rustc-link-lib={llama_libs_kind}=mtmd");
     }
 
+    // A shared build installs `llama-common` beside `llama`, so it is already in `llama_libs`;
+    // only static builds leave it in the CMake build tree.
     let common_lib_dir = out_dir.join("build").join("common");
-    if cfg!(feature = "common") && common_lib_dir.is_dir() {
+    let common_installed = llama_libs.iter().any(|lib| lib == "llama-common");
+    if cfg!(feature = "common") && !common_installed && common_lib_dir.is_dir() {
         println!(
             "cargo:rustc-link-search=native={}",
             common_lib_dir.display()
@@ -1412,23 +1419,9 @@ fn main() {
             println!("cargo:rustc-link-lib={llama_libs_kind}=ggml-cpu");
         }
     }
-    // Drop llama.cpp's tool implementations — batched-bench, bench, completion, fit-params,
-    // perplexity, quantize. They are built because mtmd lives under `llama.cpp/tools`, so
-    // `LLAMA_BUILD_TOOLS` has to be ON to get it and produces the whole set alongside it, but no
-    // binding here calls into them.
-    //
-    // Linking them is not free: each becomes an `@rpath` dependency of every consumer, so a macOS
-    // bundle either ships six libraries nothing uses or refuses to start when they are absent, and
-    // a consumer that resolves its libraries through an injected loader path needs the build tree
-    // to still exist for libraries it never calls.
-    llama_libs.retain(|lib| !lib.ends_with("-impl"));
 
     for lib in llama_libs {
-        let link = format!(
-            "cargo:rustc-link-lib={}={}",
-            llama_libs_kind,
-            lib_name(&lib)
-        );
+        let link = format!("cargo:rustc-link-lib={llama_libs_kind}={lib}");
         debug_log!("LINK {link}",);
         println!("{link}",);
     }
