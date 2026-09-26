@@ -79,11 +79,13 @@ impl<'model> LlamaContext<'model> {
     }
 
     pub(crate) fn with_samplers(
+        llama_model: &'model LlamaModel,
         llama_context: Ptr<llama_cpp_sys_2::llama_context>,
         backend_samplers: Vec<(i32, LlamaSampler)>,
     ) -> Self {
         Self {
             context: llama_context,
+            model: LlamaContextModel::Borrowed(llama_model),
             _backend_samplers: backend_samplers,
             data: PhantomData,
         }
