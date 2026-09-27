@@ -614,6 +614,45 @@ fn run_git(dir: &Path, args: &[&str]) {
     }
 }
 
+/// Returns the `-C target-cpu` value `rustc` compiles with, from `CARGO_ENCODED_RUSTFLAGS`.
+///
+/// Cargo separates the flags with `\x1f`, and a flag may name the CPU as `-Ctarget-cpu=…`,
+/// `--codegen=target-cpu=…`, or as a separate `target-cpu=…` argument after `-C`.
+///
+/// `rustc` applies the last `target-cpu` it is given, so a later flag wins over an earlier one.
+/// That is how a distribution build overrides a `target-cpu=native` from the machine's cargo
+/// configuration with `--config` flags that cargo appends after it.
+fn rustc_target_cpu(encoded_rustflags: &str) -> Option<&str> {
+    encoded_rustflags
+        .split('\x1f')
+        .rev()
+        .find_map(|flag| flag.split_once("target-cpu=").map(|(_, cpu)| cpu))
+}
+
+/// Returns the GCC and Clang flag that compiles C and C++ for `cpu`, a `rustc` CPU name.
+///
+/// `rustc` names CPUs as LLVM does, and both compilers accept those names, but under a
+/// different option per architecture.
+/// x86 takes them as `-march=` and rejects `-mcpu=`.
+/// Arm takes them as `-mcpu=`, while its `-march=` takes an architecture version such as
+/// `armv8-a` and rejects `apple-m1` or `generic`.
+///
+/// Every other target gets no flag, and llama.cpp builds for the compiler's default CPU there,
+/// rather than a spelling that fails: RISC-V's `-march=` takes an ISA string, for example, and
+/// PowerPC has no `-march=` at all.
+/// MSVC gets none either, because `cl` selects an instruction set with `/arch:` and has no CPU
+/// names.
+fn cpu_selection_flag(target_arch: &str, target_env: &str, cpu: &str) -> Option<String> {
+    if target_env == "msvc" {
+        return None;
+    }
+    match target_arch {
+        "x86" | "x86_64" => Some(format!("-march={cpu}")),
+        "aarch64" | "arm" => Some(format!("-mcpu={cpu}")),
+        _ => None,
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
@@ -975,13 +1014,7 @@ fn main() {
     // extract the target-cpu config value, if specified
     let target_cpu = std::env::var("CARGO_ENCODED_RUSTFLAGS")
         .ok()
-        .and_then(|rustflags| {
-            rustflags
-                .split('\x1f')
-                .find(|f| f.contains("target-cpu="))
-                .and_then(|f| f.split("target-cpu=").nth(1))
-                .map(|s| s.to_string())
-        });
+        .and_then(|rustflags| rustc_target_cpu(&rustflags).map(str::to_owned));
 
     if target_cpu == Some("native".into()) {
         debug_log!("Detected target-cpu=native, compiling with GGML_NATIVE");
@@ -992,11 +1025,17 @@ fn main() {
         // rust code isn't using `target-cpu=native`, so llama.cpp shouldn't use GGML_NATIVE either
         config.define("GGML_NATIVE", "OFF");
 
-        // if `target-cpu` is set set, also set -march for llama.cpp to the same value
-        if let Some(ref cpu) = target_cpu {
-            debug_log!("Setting baseline architecture: -march={}", cpu);
-            config.cflag(format!("-march={}", cpu));
-            config.cxxflag(format!("-march={}", cpu));
+        // If `target-cpu` is set, compile llama.cpp for the same CPU, spelled the way the
+        // target's C compiler expects it.
+        let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+        let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+        if let Some(flag) = target_cpu
+            .as_deref()
+            .and_then(|cpu| cpu_selection_flag(&target_arch, &target_env, cpu))
+        {
+            debug_log!("Setting baseline architecture: {}", flag);
+            config.cflag(&flag);
+            config.cxxflag(&flag);
         }
 
         // cargo only sets this when at least one target feature is enabled, which
