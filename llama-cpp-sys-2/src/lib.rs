@@ -57,6 +57,11 @@ extern "C" {
     ) -> !;
 }
 
+/// Compile-time path to the built GGML backend modules directory.
+/// Populated by build.rs from `GGML_BACKENDS_DIR`.
+/// None on static builds or when the feature is disabled.
+pub const BACKENDS_DIR: Option<&str> = option_env!("GGML_BACKENDS_DIR");
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -88,8 +93,3 @@ mod tests {
         );
     }
 }
-
-/// Compile-time path to the built GGML backend modules directory.
-/// Populated by build.rs from `GGML_BACKENDS_DIR`.
-/// None on static builds or when the feature is disabled.
-pub const BACKENDS_DIR: Option<&str> = option_env!("GGML_BACKENDS_DIR");
