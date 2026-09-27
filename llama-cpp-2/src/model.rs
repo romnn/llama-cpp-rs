@@ -847,10 +847,14 @@ impl LlamaModel {
                 }
                 parsed
             };
-            let preserved_tokens =
-                ffi_string_array(raw_result.preserved_tokens, raw_result.preserved_tokens_count)?;
-            let additional_stops =
-                ffi_string_array(raw_result.additional_stops, raw_result.additional_stops_count)?;
+            let preserved_tokens = ffi_string_array(
+                raw_result.preserved_tokens,
+                raw_result.preserved_tokens_count,
+            )?;
+            let additional_stops = ffi_string_array(
+                raw_result.additional_stops,
+                raw_result.additional_stops_count,
+            )?;
             let parse_tool_calls = tools_json.is_some_and(|tools| !tools.is_empty());
             Ok(ChatTemplateResult {
                 prompt,
@@ -1026,10 +1030,14 @@ impl LlamaModel {
                 }
                 parsed
             };
-            let preserved_tokens =
-                ffi_string_array(raw_result.preserved_tokens, raw_result.preserved_tokens_count)?;
-            let additional_stops =
-                ffi_string_array(raw_result.additional_stops, raw_result.additional_stops_count)?;
+            let preserved_tokens = ffi_string_array(
+                raw_result.preserved_tokens,
+                raw_result.preserved_tokens_count,
+            )?;
+            let additional_stops = ffi_string_array(
+                raw_result.additional_stops,
+                raw_result.additional_stops_count,
+            )?;
 
             Ok(ChatTemplateResult {
                 prompt,
