@@ -523,6 +523,12 @@ pub struct LlamaBackendDevice {
     pub memory_free: usize,
     /// Device type
     pub device_type: LlamaBackendDeviceType,
+    /// The device's lower-case PCI bus id, formatted as `domain:bus:device.function` (e.g.
+    /// `"0000:01:00.0"`), or `None` when the backend does not know it.
+    ///
+    /// Backends that see the same physical GPU report the same id, which is how llama.cpp
+    /// tells a CUDA device and a Vulkan device on one card apart from two cards.
+    pub device_id: Option<String>,
 }
 
 /// List ggml backend devices
@@ -552,6 +558,7 @@ pub fn list_llama_ggml_backend_devices() -> Vec<LlamaBackendDevice> {
         let backend = cstr_to_string(backend_name);
         let memory_total = props.memory_total;
         let memory_free = props.memory_free;
+        let device_id = (!props.device_id.is_null()).then(|| cstr_to_string(props.device_id));
         let device_type = match props.type_ {
             llama_cpp_sys_2::GGML_BACKEND_DEVICE_TYPE_CPU => LlamaBackendDeviceType::Cpu,
             llama_cpp_sys_2::GGML_BACKEND_DEVICE_TYPE_ACCEL => LlamaBackendDeviceType::Accelerator,
@@ -567,9 +574,82 @@ pub fn list_llama_ggml_backend_devices() -> Vec<LlamaBackendDevice> {
             memory_total,
             memory_free,
             device_type,
+            device_id,
         });
     }
     devices
+}
+
+/// A property a ggml backend reports about how it was built, such as the CUDA architectures
+/// it carries code for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlamaBackendFeature {
+    /// The feature's name (e.g. `"ARCHS"`)
+    pub name: String,
+    /// The feature's value (e.g. `"750,800,860,890,900,1200"`)
+    pub value: String,
+}
+
+/// List the build features a registered ggml backend reports, looked up by its registry name
+/// (e.g. `"CUDA"`).
+///
+/// The CUDA backend reports `ARCHS`, the comma-separated `__CUDA_ARCH__` values it was
+/// compiled for, lowest first.
+/// Returns an empty list when no backend of that name is registered or it reports nothing.
+#[must_use]
+pub fn list_llama_ggml_backend_features(backend: &str) -> Vec<LlamaBackendFeature> {
+    let Ok(backend) = CString::new(backend) else {
+        return Vec::new();
+    };
+    let reg = unsafe { llama_cpp_sys_2::ggml_backend_reg_by_name(backend.as_ptr()) };
+    if reg.is_null() {
+        return Vec::new();
+    }
+    let get_features = unsafe {
+        llama_cpp_sys_2::ggml_backend_reg_get_proc_address(
+            reg,
+            c"ggml_backend_get_features".as_ptr(),
+        )
+    };
+    if get_features.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: ggml registers `ggml_backend_get_features` with the signature of
+    // `ggml_backend_get_features_t`, and a non-null pointer converts to `Some`.
+    let get_features = unsafe {
+        std::mem::transmute::<*mut std::ffi::c_void, llama_cpp_sys_2::ggml_backend_get_features_t>(
+            get_features,
+        )
+    };
+    let Some(get_features) = get_features else {
+        return Vec::new();
+    };
+
+    let mut features = Vec::new();
+    // SAFETY: the backend returns an array terminated by an entry with a null name, which
+    // stays valid for the life of the process.
+    let mut feature = unsafe { get_features(reg) };
+    while !feature.is_null() {
+        let llama_cpp_sys_2::ggml_backend_feature { name, value } = unsafe { *feature };
+        if name.is_null() {
+            break;
+        }
+        let read = |ptr: *const c_char| {
+            if ptr.is_null() {
+                String::new()
+            } else {
+                unsafe { CStr::from_ptr(ptr) }
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        };
+        features.push(LlamaBackendFeature {
+            name: read(name),
+            value: read(value),
+        });
+        feature = unsafe { feature.add(1) };
+    }
+    features
 }
 
 /// Options to configure how llama.cpp logs are intercepted.
