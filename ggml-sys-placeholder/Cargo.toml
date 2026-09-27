@@ -1,0 +1,15 @@
+[package]
+name = "ggml-sys"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Stands in for the consumer-provided ggml-sys so this workspace resolves on its own"
+
+# The backend features `llama-cpp-sys-2` forwards with `ggml-sys?/<backend>`. Cargo checks that
+# they exist even while the optional dependency is off.
+[features]
+cuda = []
+hipblas = []
+metal = []
+openmp = []
+vulkan = []

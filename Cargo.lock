@@ -732,6 +732,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ggml-sys"
+version = "0.0.0"
+
+[[package]]
 name = "glob"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1200,6 +1204,7 @@ dependencies = [
  "cc",
  "cmake",
  "find_cuda_helper",
+ "ggml-sys",
  "glob",
  "walkdir",
 ]
