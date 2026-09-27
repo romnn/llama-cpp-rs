@@ -87,6 +87,60 @@ llama_rs_status llama_rs_chat_parse_to_oaicompat(
 
 void llama_rs_chat_msg_free_oaicompat(struct llama_rs_chat_msg_oaicompat * msg);
 
+// One change between two successive parses of a streamed response, as computed by
+// `common_chat_msg_diff::compute_diffs`.
+// No string is null.
+// `tool_call_index` is `SIZE_MAX` when the diff concerns no tool call.
+// A known call's `tool_call_name` and `tool_call_id` are empty unless they changed, while a newly
+// found call carries its full current state.
+struct llama_rs_chat_msg_diff_oaicompat {
+    char * reasoning_content_delta;
+    char * content_delta;
+    size_t tool_call_index;
+    char * tool_call_name;
+    char * tool_call_arguments;
+    char * tool_call_id;
+};
+
+// Parses the responses of one chat template: the serialized parser is loaded once, and the
+// streamed response so far is kept to report what each update changed.
+struct llama_rs_chat_parser;
+
+// Creates a parser from the fields of a chat template result.
+// On success the caller owns `out_parser` and must release it with `llama_rs_chat_parser_free`.
+llama_rs_status llama_rs_chat_parser_init(
+    int chat_format,
+    bool parse_tool_calls,
+    const char * parser_data,
+    const char * generation_prompt,
+    struct llama_rs_chat_parser ** out_parser);
+
+void llama_rs_chat_parser_free(struct llama_rs_chat_parser * parser);
+
+// Parses `input` on its own, independent of the streamed response.
+// The result equals `llama_rs_chat_parse_to_oaicompat` with the parser's fields.
+llama_rs_status llama_rs_chat_parser_parse(
+    const struct llama_rs_chat_parser * parser,
+    const char * input,
+    bool is_partial,
+    struct llama_rs_chat_msg_oaicompat * out_msg);
+
+// Appends `text_added` to the streamed response, parses the whole response, and returns the diffs
+// from the previous update, as llama-server's `task_result_state::update_chat_msg` does.
+// A parse that finds nothing yet reports no diffs and keeps the previous message.
+// On success the caller owns `out_diffs` and must release it with
+// `llama_rs_chat_msg_diffs_free_oaicompat`.
+llama_rs_status llama_rs_chat_parser_update(
+    struct llama_rs_chat_parser * parser,
+    const char * text_added,
+    bool is_partial,
+    struct llama_rs_chat_msg_diff_oaicompat ** out_diffs,
+    size_t * out_diffs_count);
+
+void llama_rs_chat_msg_diffs_free_oaicompat(
+    struct llama_rs_chat_msg_diff_oaicompat * diffs,
+    size_t count);
+
 #ifdef __cplusplus
 }
 #endif

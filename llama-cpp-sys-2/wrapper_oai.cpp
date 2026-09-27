@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -394,6 +395,26 @@ extern "C" llama_rs_status llama_rs_apply_chat_template_oaicompat(
     }
 }
 
+// Builds the parse settings of a chat template result.
+// Loading `parser_data` deserializes the template's whole PEG parser, so a caller parsing many
+// responses keeps the result.
+static common_chat_parser_params make_chat_parser_params(
+    int chat_format,
+    bool parse_tool_calls,
+    const char * parser_data,
+    const char * generation_prompt) {
+    common_chat_parser_params syntax;
+    syntax.format = static_cast<common_chat_format>(chat_format);
+    syntax.parse_tool_calls = parse_tool_calls;
+    if (generation_prompt && std::strlen(generation_prompt) > 0) {
+        syntax.generation_prompt = generation_prompt;
+    }
+    if (parser_data && std::strlen(parser_data) > 0) {
+        syntax.parser.load(parser_data);
+    }
+    return syntax;
+}
+
 extern "C" llama_rs_status llama_rs_chat_parse_to_oaicompat(
     const char * input,
     bool is_partial,
@@ -408,15 +429,8 @@ extern "C" llama_rs_status llama_rs_chat_parse_to_oaicompat(
     init_chat_msg(out_msg);
 
     try {
-        common_chat_parser_params syntax;
-        syntax.format = static_cast<common_chat_format>(chat_format);
-        syntax.parse_tool_calls = parse_tool_calls;
-        if (generation_prompt && std::strlen(generation_prompt) > 0) {
-            syntax.generation_prompt = generation_prompt;
-        }
-        if (parser_data && std::strlen(parser_data) > 0) {
-            syntax.parser.load(parser_data);
-        }
+        const auto syntax =
+            make_chat_parser_params(chat_format, parse_tool_calls, parser_data, generation_prompt);
 
         // Tool-call ids are intentionally left as parsed (usually empty): id
         // assignment is caller policy, and generating ids here would require
@@ -482,4 +496,153 @@ extern "C" void llama_rs_chat_msg_free_oaicompat(struct llama_rs_chat_msg_oaicom
     msg->tool_call_id = nullptr;
     msg->tool_calls = nullptr;
     msg->tool_calls_count = 0;
+}
+
+struct llama_rs_chat_parser {
+    common_chat_parser_params params;
+    // The streamed response so far and the latest non-empty message parsed from it.
+    std::string generated_text;
+    common_chat_msg chat_msg;
+};
+
+extern "C" llama_rs_status llama_rs_chat_parser_init(
+    int chat_format,
+    bool parse_tool_calls,
+    const char * parser_data,
+    const char * generation_prompt,
+    struct llama_rs_chat_parser ** out_parser) {
+    if (!out_parser) {
+        return LLAMA_RS_STATUS_INVALID_ARGUMENT;
+    }
+    *out_parser = nullptr;
+
+    try {
+        auto parser = std::make_unique<llama_rs_chat_parser>();
+        parser->params =
+            make_chat_parser_params(chat_format, parse_tool_calls, parser_data, generation_prompt);
+        *out_parser = parser.release();
+        return LLAMA_RS_STATUS_OK;
+    } catch (const std::exception &) {
+        return LLAMA_RS_STATUS_EXCEPTION;
+    } catch (...) {
+        return LLAMA_RS_STATUS_EXCEPTION;
+    }
+}
+
+extern "C" void llama_rs_chat_parser_free(struct llama_rs_chat_parser * parser) {
+    delete parser;
+}
+
+extern "C" llama_rs_status llama_rs_chat_parser_parse(
+    const struct llama_rs_chat_parser * parser,
+    const char * input,
+    bool is_partial,
+    struct llama_rs_chat_msg_oaicompat * out_msg) {
+    if (!parser || !input || !out_msg) {
+        return LLAMA_RS_STATUS_INVALID_ARGUMENT;
+    }
+    init_chat_msg(out_msg);
+
+    try {
+        const auto msg = common_chat_parse(input, is_partial, parser->params);
+        const auto status = fill_chat_msg(msg, out_msg);
+        if (status != LLAMA_RS_STATUS_OK) {
+            llama_rs_chat_msg_free_oaicompat(out_msg);
+            return status;
+        }
+        return LLAMA_RS_STATUS_OK;
+    } catch (const std::exception &) {
+        llama_rs_chat_msg_free_oaicompat(out_msg);
+        return LLAMA_RS_STATUS_EXCEPTION;
+    } catch (...) {
+        llama_rs_chat_msg_free_oaicompat(out_msg);
+        return LLAMA_RS_STATUS_EXCEPTION;
+    }
+}
+
+static void free_chat_msg_diff(struct llama_rs_chat_msg_diff_oaicompat * diff) {
+    std::free(diff->reasoning_content_delta);
+    std::free(diff->content_delta);
+    std::free(diff->tool_call_name);
+    std::free(diff->tool_call_arguments);
+    std::free(diff->tool_call_id);
+}
+
+static llama_rs_status fill_chat_msg_diffs(
+    const std::vector<common_chat_msg_diff> & diffs,
+    struct llama_rs_chat_msg_diff_oaicompat ** out_diffs,
+    size_t * out_diffs_count) {
+    if (diffs.empty()) {
+        return LLAMA_RS_STATUS_OK;
+    }
+
+    auto * items = static_cast<struct llama_rs_chat_msg_diff_oaicompat *>(
+        std::malloc(sizeof(struct llama_rs_chat_msg_diff_oaicompat) * diffs.size()));
+    if (!items) {
+        return LLAMA_RS_STATUS_ALLOCATION_FAILED;
+    }
+    for (size_t i = 0; i < diffs.size(); ++i) {
+        const auto & diff = diffs[i];
+        auto & item = items[i];
+        item.reasoning_content_delta = llama_rs_dup_string(diff.reasoning_content_delta);
+        item.content_delta = llama_rs_dup_string(diff.content_delta);
+        item.tool_call_index = diff.tool_call_index;
+        item.tool_call_name = llama_rs_dup_string(diff.tool_call_delta.name);
+        item.tool_call_arguments = llama_rs_dup_string(diff.tool_call_delta.arguments);
+        item.tool_call_id = llama_rs_dup_string(diff.tool_call_delta.id);
+        if (!item.reasoning_content_delta || !item.content_delta || !item.tool_call_name
+            || !item.tool_call_arguments || !item.tool_call_id) {
+            for (size_t j = 0; j <= i; ++j) {
+                free_chat_msg_diff(&items[j]);
+            }
+            std::free(items);
+            return LLAMA_RS_STATUS_ALLOCATION_FAILED;
+        }
+    }
+
+    *out_diffs = items;
+    *out_diffs_count = diffs.size();
+    return LLAMA_RS_STATUS_OK;
+}
+
+extern "C" llama_rs_status llama_rs_chat_parser_update(
+    struct llama_rs_chat_parser * parser,
+    const char * text_added,
+    bool is_partial,
+    struct llama_rs_chat_msg_diff_oaicompat ** out_diffs,
+    size_t * out_diffs_count) {
+    if (!parser || !text_added || !out_diffs || !out_diffs_count) {
+        return LLAMA_RS_STATUS_INVALID_ARGUMENT;
+    }
+    *out_diffs = nullptr;
+    *out_diffs_count = 0;
+
+    try {
+        // Like llama-server, parse the whole response again: the PEG parser cannot resume from an
+        // earlier parse, so only the loaded parser is reused.
+        parser->generated_text += text_added;
+        auto new_msg = common_chat_parse(parser->generated_text, is_partial, parser->params);
+        if (new_msg.empty()) {
+            return LLAMA_RS_STATUS_OK;
+        }
+        const auto diffs = common_chat_msg_diff::compute_diffs(parser->chat_msg, new_msg);
+        parser->chat_msg = std::move(new_msg);
+        return fill_chat_msg_diffs(diffs, out_diffs, out_diffs_count);
+    } catch (const std::exception &) {
+        return LLAMA_RS_STATUS_EXCEPTION;
+    } catch (...) {
+        return LLAMA_RS_STATUS_EXCEPTION;
+    }
+}
+
+extern "C" void llama_rs_chat_msg_diffs_free_oaicompat(
+    struct llama_rs_chat_msg_diff_oaicompat * diffs,
+    size_t count) {
+    if (!diffs) {
+        return;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        free_chat_msg_diff(&diffs[i]);
+    }
+    std::free(diffs);
 }
