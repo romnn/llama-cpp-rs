@@ -9,6 +9,7 @@ use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::slice;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use crate::context::LlamaContext;
 use crate::model::LlamaModel;
@@ -61,6 +62,7 @@ impl From<llama_cpp_sys_2::mtmd_input_chunk_type> for MtmdInputChunkType {
 ///
 /// let params = MtmdContextParams {
 ///     use_gpu: false,
+///     device: None,
 ///     print_timings: true,
 ///     n_threads: 4,
 ///     media_marker: CString::new(mtmd_default_marker()).unwrap(),
@@ -72,6 +74,11 @@ impl From<llama_cpp_sys_2::mtmd_input_chunk_type> for MtmdInputChunkType {
 pub struct MtmdContextParams {
     /// Whether to use GPU acceleration
     pub use_gpu: bool,
+    /// Index of the ggml backend device the projector runs on when `use_gpu` is set, as
+    /// [`crate::list_llama_ggml_backend_devices`] lists it.
+    ///
+    /// `None` lets llama.cpp pick the first GPU, or the first integrated GPU when there is none.
+    pub device: Option<usize>,
     /// Whether to print timing information
     pub print_timings: bool,
     /// Number of threads to use for processing
@@ -100,6 +107,7 @@ impl From<&MtmdContextParams> for llama_cpp_sys_2::mtmd_context_params {
         let mut context = unsafe { llama_cpp_sys_2::mtmd_context_params_default() };
         let MtmdContextParams {
             use_gpu,
+            device,
             print_timings,
             n_threads,
             media_marker,
@@ -108,6 +116,14 @@ impl From<&MtmdContextParams> for llama_cpp_sys_2::mtmd_context_params {
         } = params;
 
         context.use_gpu = *use_gpu;
+        // An index outside the registry leaves the choice to llama.cpp rather than tripping
+        // `ggml_backend_dev_get`'s assertion; `MtmdContext::init_from_file` rejects it first.
+        // SAFETY: both registry calls take no pointers, and the filter keeps the index in range.
+        context.device = device
+            .filter(|index| *index < unsafe { llama_cpp_sys_2::ggml_backend_dev_count() })
+            .map_or(std::ptr::null_mut(), |index| unsafe {
+                llama_cpp_sys_2::ggml_backend_dev_get(index)
+            });
         context.print_timings = *print_timings;
         context.n_threads = *n_threads;
         context.media_marker = media_marker.as_ptr();
@@ -122,6 +138,7 @@ impl From<llama_cpp_sys_2::mtmd_context_params> for MtmdContextParams {
     fn from(params: llama_cpp_sys_2::mtmd_context_params) -> Self {
         Self {
             use_gpu: params.use_gpu,
+            device: backend_device_index(params.device),
             print_timings: params.print_timings,
             n_threads: params.n_threads,
             media_marker: unsafe { CStr::from_ptr(params.media_marker) }.to_owned(),
@@ -129,6 +146,27 @@ impl From<llama_cpp_sys_2::mtmd_context_params> for MtmdContextParams {
             image_max_tokens: params.image_max_tokens,
         }
     }
+}
+
+/// Returns the registry index of a ggml backend device, or `None` for a null or unregistered one.
+fn backend_device_index(device: llama_cpp_sys_2::ggml_backend_dev_t) -> Option<usize> {
+    if device.is_null() {
+        return None;
+    }
+    // SAFETY: the registry calls take no pointers, and every index is below the count.
+    let count = unsafe { llama_cpp_sys_2::ggml_backend_dev_count() };
+    (0..count).find(|index| unsafe { llama_cpp_sys_2::ggml_backend_dev_get(*index) } == device)
+}
+
+/// Memory a projector would hold on one ggml backend device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MtmdDeviceMemory {
+    /// Index of the device, as [`crate::list_llama_ggml_backend_devices`] lists it.
+    pub device_index: usize,
+    /// Bytes on this device: the weights plus the warmup compute buffers from
+    /// [`MtmdContext::estimate_memory_usage`], or one input's compute buffers from
+    /// [`MtmdContext::estimate_chunk_compute`].
+    pub bytes: usize,
 }
 
 /// Text input configuration
@@ -158,12 +196,29 @@ pub struct MtmdInputText {
 ///
 /// This represents an initialized multimodal context that can process
 /// text, images, and audio through llama.cpp's multimodal interface.
+///
+/// # Thread safety
+///
+/// A context may be shared across threads.
+/// Upstream allows tokenizing and creating bitmaps on a shared context, and the decode queries
+/// ([`Self::decode_use_mrope`], [`Self::decode_use_non_causal`], and the ones
+/// [`MtmdInputChunk::decode_embeddings`] makes) only read what `mtmd_init_from_file` set up.
+/// Encoding and projecting a chunk's compute write the context's compute graph, scheduler,
+/// buffers, and output embeddings, so this wrapper runs one of them at a time: a second call waits
+/// for the first, and embeddings are copied out before another encode can overwrite them.
+/// A tokenization or decode on another thread proceeds while an encode runs.
 #[derive(Debug)]
 pub struct MtmdContext {
     pub(crate) context: NonNull<llama_cpp_sys_2::mtmd_context>,
+    /// Width of one output embedding row, the text model's input embedding width, which
+    /// `mtmd_init_from_file` checks the projector against.
+    embedding_width: usize,
+    /// Held by every call that writes the context's compute state.
+    compute: Mutex<()>,
 }
 
-// MtmdContext is thread safe
+// SAFETY: the reads upstream allows on a shared context are the only unguarded calls, and
+// `compute` serializes every call that writes to it.
 unsafe impl Send for MtmdContext {}
 unsafe impl Sync for MtmdContext {}
 
@@ -184,6 +239,7 @@ impl MtmdContext {
     ///
     /// This function will return an error if:
     /// - The path cannot be converted to a C string
+    /// - `params.device` is not a registered ggml backend device
     /// - The underlying C function returns null (indicating initialization failure)
     pub fn init_from_file(
         mmproj_path: &str,
@@ -191,6 +247,9 @@ impl MtmdContext {
         params: &MtmdContextParams,
     ) -> Result<Self, MtmdInitError> {
         let path_cstr = CString::new(mmproj_path)?;
+        if let Some(UnregisteredDevice { index, count }) = unregistered_device(params) {
+            return Err(MtmdInitError::InvalidDevice { index, count });
+        }
         let ctx_params = llama_cpp_sys_2::mtmd_context_params::from(params);
 
         let context = unsafe {
@@ -202,7 +261,143 @@ impl MtmdContext {
         };
 
         let context = NonNull::new(context).ok_or(MtmdInitError::NullResult)?;
-        Ok(Self { context })
+        // SAFETY: `text_model` holds a loaded model for the duration of the borrow.
+        let embedding_width =
+            unsafe { llama_cpp_sys_2::llama_model_n_embd_inp(text_model.model.as_ptr()) };
+        Ok(Self {
+            context,
+            // A model never reports a negative width; zero makes every readout empty.
+            embedding_width: usize::try_from(embedding_width).unwrap_or(0),
+            compute: Mutex::new(()),
+        })
+    }
+
+    /// Waits for any other call that writes the context's compute state, and holds off the next
+    /// one until the returned guard drops.
+    fn lock_compute(&self) -> MutexGuard<'_, ()> {
+        // The lock guards no data of its own, so a panic while it was held leaves nothing torn.
+        self.compute.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Projects the memory [`Self::init_from_file`] would allocate for the projector at
+    /// `mmproj_path` with `params`, per ggml backend device, without loading its weights.
+    ///
+    /// Each entry covers the weights plus the compute buffer the projector reserves for its warmup
+    /// image, which some projector types cap below their largest input.
+    /// This wraps upstream's `mtmd_get_memory_usage`, which llama-server uses to reserve the
+    /// projector's memory before fitting a model.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path is not a valid C string, `params.device` is not a
+    /// registered device, or llama.cpp cannot read the projector or plan its graph.
+    pub fn estimate_memory_usage(
+        mmproj_path: &str,
+        params: &MtmdContextParams,
+    ) -> Result<Vec<MtmdDeviceMemory>, MtmdMemoryEstimateError> {
+        let path_cstr = CString::new(mmproj_path)?;
+        if let Some(UnregisteredDevice { index, count }) = unregistered_device(params) {
+            return Err(MtmdMemoryEstimateError::InvalidDevice { index, count });
+        }
+        let ctx_params = llama_cpp_sys_2::mtmd_context_params::from(params);
+        // SAFETY: the registry count takes no arguments.
+        let capacity = unsafe { llama_cpp_sys_2::ggml_backend_dev_count() };
+        let mut devices = vec![
+            llama_cpp_sys_2::llama_rs_mtmd_device_memory {
+                device_index: 0,
+                bytes: 0,
+            };
+            capacity
+        ];
+        let mut device_count = 0_usize;
+
+        // SAFETY: the path and the media marker `ctx_params` points at outlive the call, and
+        // `devices` holds as many entries as the length passed with it.
+        let status = unsafe {
+            llama_cpp_sys_2::llama_rs_mtmd_estimate_memory_usage(
+                path_cstr.as_ptr(),
+                &raw const ctx_params,
+                devices.as_mut_ptr(),
+                devices.len(),
+                &raw mut device_count,
+            )
+        };
+        match status {
+            llama_cpp_sys_2::LLAMA_RS_MTMD_STATUS_OK => Ok(devices
+                .iter()
+                .take(device_count)
+                .map(|device| MtmdDeviceMemory {
+                    device_index: device.device_index,
+                    bytes: device.bytes,
+                })
+                .collect()),
+            llama_cpp_sys_2::LLAMA_RS_MTMD_STATUS_UNKNOWN_DEVICE => {
+                Err(MtmdMemoryEstimateError::UnknownDevice)
+            }
+            _ => Err(MtmdMemoryEstimateError::ProjectionFailed),
+        }
+    }
+
+    /// Projects the compute buffers encoding `chunk` with this context needs, per ggml backend
+    /// device, without allocating them.
+    ///
+    /// An encode grows the projector's compute buffers to its input's graph, and they keep that
+    /// size, which can be far beyond the warmup image [`Self::estimate_memory_usage`] covers.
+    /// This is the size encoding `chunk` grows them to.
+    /// The projection leaves the context's buffers as they are, and it covers only those buffers,
+    /// not the scratch memory a backend such as CUDA takes from its own pool during the encode.
+    /// A text chunk needs no compute buffers and projects to no devices.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MtmdMemoryEstimateError::ProjectionFailed`] when llama.cpp cannot plan the
+    /// chunk's graph, and [`MtmdMemoryEstimateError::UnknownDevice`] when it charges a device
+    /// outside the ggml backend registry.
+    pub fn estimate_chunk_compute(
+        &self,
+        chunk: &MtmdInputChunk<'_>,
+    ) -> Result<Vec<MtmdDeviceMemory>, MtmdMemoryEstimateError> {
+        if chunk.chunk_type() == MtmdInputChunkType::Text {
+            return Ok(Vec::new());
+        }
+        // SAFETY: the registry count takes no arguments.
+        let capacity = unsafe { llama_cpp_sys_2::ggml_backend_dev_count() };
+        let mut devices = vec![
+            llama_cpp_sys_2::llama_rs_mtmd_device_memory {
+                device_index: 0,
+                bytes: 0,
+            };
+            capacity
+        ];
+        let mut device_count = 0_usize;
+
+        // The projection builds the chunk's graph in the context's graph memory.
+        let _compute = self.lock_compute();
+        // SAFETY: the context and the chunk are live for the duration of the call, and `devices`
+        // holds as many entries as the length passed with it.
+        let status = unsafe {
+            llama_cpp_sys_2::llama_rs_mtmd_chunk_compute_usage(
+                self.context.as_ptr(),
+                chunk.chunk.as_ptr(),
+                devices.as_mut_ptr(),
+                devices.len(),
+                &raw mut device_count,
+            )
+        };
+        match status {
+            llama_cpp_sys_2::LLAMA_RS_MTMD_STATUS_OK => Ok(devices
+                .iter()
+                .take(device_count)
+                .map(|device| MtmdDeviceMemory {
+                    device_index: device.device_index,
+                    bytes: device.bytes,
+                })
+                .collect()),
+            llama_cpp_sys_2::LLAMA_RS_MTMD_STATUS_UNKNOWN_DEVICE => {
+                Err(MtmdMemoryEstimateError::UnknownDevice)
+            }
+            _ => Err(MtmdMemoryEstimateError::ProjectionFailed),
+        }
     }
 
     /// Check whether non-causal attention mask is needed before `llama_decode`.
@@ -326,8 +521,8 @@ impl MtmdContext {
     /// Encode a chunk for image/audio processing.
     ///
     /// This function processes image or audio chunks by encoding them into
-    /// embeddings that can be used by the language model. The embeddings
-    /// can be retrieved using `get_output_embeddings()`.
+    /// embeddings that can be used by the language model.
+    /// Use [`Self::encode_chunk_embeddings`] to also read the embeddings back.
     ///
     /// # Arguments
     ///
@@ -341,6 +536,14 @@ impl MtmdContext {
     ///
     /// Returns `MtmdEncodeError::EncodeFailure` if encoding fails.
     pub fn encode_chunk(&self, chunk: &MtmdInputChunk<'_>) -> Result<(), MtmdEncodeError> {
+        let _compute = self.lock_compute();
+        self.encode_chunk_locked(chunk)
+    }
+
+    /// Encodes `chunk` while the caller holds [`Self::lock_compute`].
+    fn encode_chunk_locked(&self, chunk: &MtmdInputChunk<'_>) -> Result<(), MtmdEncodeError> {
+        // SAFETY: the context and the chunk are live for the duration of the call, and the
+        // caller's compute lock keeps every other writer of the context out.
         let result = unsafe {
             llama_cpp_sys_2::mtmd_encode_chunk(self.context.as_ptr(), chunk.chunk.as_ptr())
         };
@@ -351,6 +554,56 @@ impl MtmdContext {
             Err(MtmdEncodeError::EncodeFailure(result))
         }
     }
+
+    /// Encode an image or audio chunk and return its embeddings.
+    ///
+    /// The result holds one row per chunk token, each as wide as the text model's input
+    /// embeddings, which is what `mtmd_helper_eval_chunks` decodes into the text model.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MtmdEncodeError::TextChunk` for a text chunk, which has no embeddings to encode,
+    /// and `MtmdEncodeError::EncodeFailure` if encoding fails.
+    pub fn encode_chunk_embeddings(
+        &self,
+        chunk: &MtmdInputChunk<'_>,
+    ) -> Result<Vec<f32>, MtmdEncodeError> {
+        // `mtmd_encode_chunk` leaves the output buffer untouched for a text chunk, so reading
+        // it would return a previous chunk's embeddings, or read past their end.
+        if chunk.chunk_type() == MtmdInputChunkType::Text {
+            return Err(MtmdEncodeError::TextChunk);
+        }
+        // Held until the embeddings are copied out, so no other encode overwrites them first.
+        let _compute = self.lock_compute();
+        self.encode_chunk_locked(chunk)?;
+
+        let len = chunk.n_tokens() * self.embedding_width;
+        // SAFETY: `self.context` is a live context owned by `self`.
+        let embeddings = unsafe { llama_cpp_sys_2::mtmd_get_output_embd(self.context.as_ptr()) };
+        if embeddings.is_null() || len == 0 {
+            return Ok(Vec::new());
+        }
+        // SAFETY: a successful encode sized the context's output buffer to the chunk's tokens
+        // times the projector's output width, which `mtmd_init_from_file` checked against the
+        // text model's input width.
+        // The buffer stays valid until the next encode, which the compute lock holds off until
+        // the copy below has finished.
+        Ok(unsafe { slice::from_raw_parts(embeddings, len) }.to_vec())
+    }
+}
+
+/// A projector device index outside the ggml backend registry.
+struct UnregisteredDevice {
+    index: usize,
+    count: usize,
+}
+
+/// Returns the requested projector device when the ggml backend registry does not hold it.
+fn unregistered_device(params: &MtmdContextParams) -> Option<UnregisteredDevice> {
+    let index = params.device?;
+    // SAFETY: the registry count takes no arguments.
+    let count = unsafe { llama_cpp_sys_2::ggml_backend_dev_count() };
+    (index >= count).then_some(UnregisteredDevice { index, count })
 }
 
 impl Drop for MtmdContext {
@@ -364,7 +617,10 @@ impl Drop for MtmdContext {
 /// Represents bitmap data for images or audio that can be processed
 /// by the multimodal system. For images, data is stored in RGB format.
 /// For audio, data is stored as PCM F32 samples.
-#[derive(Debug, Clone)]
+///
+/// Not `Clone`: the wrapper owns the bitmap and frees it on drop, so a copied pointer would be
+/// freed twice.
+#[derive(Debug)]
 pub struct MtmdBitmap {
     pub(crate) bitmap: NonNull<llama_cpp_sys_2::mtmd_bitmap>,
 }
@@ -773,6 +1029,8 @@ impl MtmdInputChunks {
     ) -> Result<llama_cpp_sys_2::llama_pos, MtmdEvalError> {
         let mut new_n_past: llama_cpp_sys_2::llama_pos = 0;
 
+        // Media chunks are encoded with the context along the way.
+        let _compute = mtmd_ctx.lock_compute();
         let result = unsafe {
             llama_cpp_sys_2::mtmd_helper_eval_chunks(
                 mtmd_ctx.context.as_ptr(),
@@ -793,6 +1051,11 @@ impl MtmdInputChunks {
         }
     }
 }
+
+// SAFETY: the collection owns its chunks and no thread-local state, and every `&self` method only
+// reads it.
+unsafe impl Send for MtmdInputChunks {}
+unsafe impl Sync for MtmdInputChunks {}
 
 impl Drop for MtmdInputChunks {
     fn drop(&mut self) {
@@ -815,6 +1078,11 @@ pub struct MtmdInputChunk<'a> {
     owned: bool,
     phantom: PhantomData<&'a MtmdInputChunks>,
 }
+
+// SAFETY: every `&self` method only reads the chunk, an owned chunk is freed only by its own drop,
+// and a borrowed one is tied to its collection, which is `Sync`.
+unsafe impl Send for MtmdInputChunk<'_> {}
+unsafe impl Sync for MtmdInputChunk<'_> {}
 
 impl MtmdInputChunk<'_> {
     /// Get the type of this chunk
@@ -884,6 +1152,142 @@ impl MtmdInputChunk<'_> {
                 .to_string_lossy()
                 .into_owned()
                 .into()
+        }
+    }
+
+    /// Evaluates this chunk into `llama_ctx` at position `n_past` of sequence `seq_id`, and returns
+    /// the position after it.
+    ///
+    /// A text chunk is decoded in batches of at most `n_batch` tokens, with logits for its last
+    /// token when `logits_last` is set.
+    /// A media chunk is encoded with `mtmd_ctx` and its embeddings decoded.
+    /// This wraps `mtmd_helper_eval_chunk_single`, the per-chunk step of
+    /// [`MtmdInputChunks::eval_chunks`], for callers that treat chunks differently.
+    ///
+    /// `llama_ctx` is borrowed mutably, as [`LlamaContext::decode`] borrows it, because the decode
+    /// overwrites the logits and embeddings that earlier reads of the context return.
+    ///
+    /// This function is NOT thread-safe.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MtmdEvalError::InvalidBatchSize`] for a batch size below one, and
+    /// [`MtmdEvalError::EvalFailure`] when encoding or decoding fails.
+    pub fn eval(
+        &self,
+        mtmd_ctx: &MtmdContext,
+        llama_ctx: &mut LlamaContext,
+        n_past: llama_cpp_sys_2::llama_pos,
+        seq_id: llama_cpp_sys_2::llama_seq_id,
+        n_batch: i32,
+        logits_last: bool,
+    ) -> Result<llama_cpp_sys_2::llama_pos, MtmdEvalError> {
+        // llama.cpp asserts on a batch size below one, which aborts the process.
+        if n_batch < 1 {
+            return Err(MtmdEvalError::InvalidBatchSize(n_batch));
+        }
+        // The helper advances a text chunk's position from the value it finds here.
+        let mut new_n_past = n_past;
+        // A media chunk is encoded with the context first; a text chunk leaves it untouched.
+        let _compute =
+            (self.chunk_type() != MtmdInputChunkType::Text).then(|| mtmd_ctx.lock_compute());
+        // SAFETY: every pointer is live for the duration of the call, the compute lock keeps
+        // other writers of the context out while a media chunk is encoded, and the helper writes
+        // only `new_n_past`.
+        let result = unsafe {
+            llama_cpp_sys_2::mtmd_helper_eval_chunk_single(
+                mtmd_ctx.context.as_ptr(),
+                llama_ctx.context.as_ptr(),
+                self.chunk.as_ptr(),
+                n_past,
+                seq_id,
+                n_batch,
+                logits_last,
+                &raw mut new_n_past,
+            )
+        };
+        if result == 0 {
+            Ok(new_n_past)
+        } else {
+            Err(MtmdEvalError::EvalFailure(result))
+        }
+    }
+
+    /// Decodes this media chunk from embeddings encoded beforehand into `llama_ctx` at position
+    /// `n_past` of sequence `seq_id`, and returns the position after it.
+    ///
+    /// `embeddings` holds one row per chunk token, each as wide as the text model's input
+    /// embeddings, as [`MtmdContext::encode_chunk_embeddings`] returns them.
+    /// `mtmd_ctx` supplies the model-specific decoding, such as non-causal attention and M-RoPE
+    /// positions, so any context of the projector that encoded the embeddings serves.
+    /// Together with [`MtmdContext::encode_chunk_embeddings`] this splits [`Self::eval`] of a
+    /// media chunk in two, so the encode can run on a different projector context than the one
+    /// the chunk was tokenized with, or on another thread while this one decodes.
+    /// This wraps `mtmd_helper_decode_image_chunk`, which only reads `mtmd_ctx`, so the decode
+    /// does not wait for an encode running on the same context.
+    ///
+    /// `llama_ctx` is borrowed mutably, as [`LlamaContext::decode`] borrows it, because the decode
+    /// overwrites the logits and embeddings that earlier reads of the context return.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MtmdEvalError::TextChunk`] for a text chunk,
+    /// [`MtmdEvalError::EmbeddingsLength`] when `embeddings` does not hold one row per token,
+    /// [`MtmdEvalError::InvalidBatchSize`] for a batch size below one, and
+    /// [`MtmdEvalError::EvalFailure`] when decoding fails.
+    pub fn decode_embeddings(
+        &self,
+        mtmd_ctx: &MtmdContext,
+        llama_ctx: &mut LlamaContext,
+        embeddings: &[f32],
+        n_past: llama_cpp_sys_2::llama_pos,
+        seq_id: llama_cpp_sys_2::llama_seq_id,
+        n_batch: i32,
+    ) -> Result<llama_cpp_sys_2::llama_pos, MtmdEvalError> {
+        if self.chunk_type() == MtmdInputChunkType::Text {
+            return Err(MtmdEvalError::TextChunk);
+        }
+        // llama.cpp asserts on a batch size below one, which aborts the process.
+        if n_batch < 1 {
+            return Err(MtmdEvalError::InvalidBatchSize(n_batch));
+        }
+        // SAFETY: the context holds a loaded model for as long as it lives.
+        let embedding_width = unsafe {
+            llama_cpp_sys_2::llama_model_n_embd_inp(llama_cpp_sys_2::llama_get_model(
+                llama_ctx.context.as_ptr(),
+            ))
+        };
+        let expected = self
+            .n_tokens()
+            .saturating_mul(usize::try_from(embedding_width).unwrap_or(0));
+        if embeddings.len() != expected {
+            return Err(MtmdEvalError::EmbeddingsLength {
+                expected,
+                actual: embeddings.len(),
+            });
+        }
+        let mut new_n_past = n_past;
+        // SAFETY: every pointer is live for the duration of the call, `embeddings` holds the
+        // `n_tokens * n_embd_inp` values the helper reads and never writes, and the helper writes
+        // only `new_n_past`.
+        let result = unsafe {
+            llama_cpp_sys_2::mtmd_helper_decode_image_chunk(
+                mtmd_ctx.context.as_ptr(),
+                llama_ctx.context.as_ptr(),
+                self.chunk.as_ptr(),
+                embeddings.as_ptr().cast_mut(),
+                n_past,
+                seq_id,
+                n_batch,
+                &raw mut new_n_past,
+                None,
+                std::ptr::null_mut(),
+            )
+        };
+        if result == 0 {
+            Ok(new_n_past)
+        } else {
+            Err(MtmdEvalError::EvalFailure(result))
         }
     }
 
@@ -961,6 +1365,36 @@ pub enum MtmdInitError {
     /// MTMD context initialization returned null
     #[error("MTMD context initialization returned null")]
     NullResult,
+    /// The requested projector device is not in the ggml backend registry
+    #[error("ggml backend device {index} does not exist; {count} devices are registered")]
+    InvalidDevice {
+        /// The requested device index
+        index: usize,
+        /// Number of registered ggml backend devices
+        count: usize,
+    },
+}
+
+/// Errors that can occur when projecting a projector's memory
+#[derive(thiserror::Error, Debug)]
+pub enum MtmdMemoryEstimateError {
+    /// Failed to create `CString` from input
+    #[error("Failed to create CString: {0}")]
+    CStringError(#[from] std::ffi::NulError),
+    /// The requested projector device is not in the ggml backend registry
+    #[error("ggml backend device {index} does not exist; {count} devices are registered")]
+    InvalidDevice {
+        /// The requested device index
+        index: usize,
+        /// Number of registered ggml backend devices
+        count: usize,
+    },
+    /// llama.cpp could not read the projector or plan its graph
+    #[error("llama.cpp could not project the projector's memory")]
+    ProjectionFailed,
+    /// llama.cpp charged memory to a device outside the ggml backend registry
+    #[error("the projector's memory was charged to an unregistered ggml backend device")]
+    UnknownDevice,
 }
 
 /// Errors that can occur when working with MTMD bitmaps
@@ -1016,6 +1450,9 @@ pub enum MtmdEncodeError {
     /// Encode operation failed
     #[error("Encode failed with code: {0}")]
     EncodeFailure(i32),
+    /// Text chunks carry tokens, not embeddings to encode
+    #[error("text chunks have no embeddings to encode")]
+    TextChunk,
 }
 
 /// Errors that can occur during evaluation
@@ -1024,4 +1461,18 @@ pub enum MtmdEvalError {
     /// Evaluation operation failed
     #[error("Eval failed with code: {0}")]
     EvalFailure(i32),
+    /// Text chunks carry tokens, not embeddings to decode
+    #[error("text chunks have no embeddings to decode")]
+    TextChunk,
+    /// The embeddings do not hold one row per chunk token
+    #[error("expected {expected} embedding values, got {actual}")]
+    EmbeddingsLength {
+        /// Values one row per chunk token takes
+        expected: usize,
+        /// Values supplied
+        actual: usize,
+    },
+    /// Chunks are decoded in batches of at least one token
+    #[error("batch size {0} is below one")]
+    InvalidBatchSize(i32),
 }

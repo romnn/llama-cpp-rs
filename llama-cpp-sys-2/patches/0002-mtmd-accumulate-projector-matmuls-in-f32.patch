@@ -1,0 +1,56 @@
+From: Airtype downstream
+Subject: [PATCH] mtmd : accumulate projector matmuls in F32
+
+The CUDA backend multiplies F16 weights through cuBLAS with CUBLAS_COMPUTE_16F and an F16
+output by default (ggml_cuda_mul_mat_cublas picks the F16 compute type for F16 and quantized
+weights on hardware with fast FP16). Vision towers produce activations beyond the F16 range, so
+on large images the projector's embeddings come out partly NaN and the language model answers
+with one repeated token, whatever the image shows. The CPU backend always accumulates in F32,
+which is why the same projector is correct on the CPU.
+
+LightOnOCR-2-1B (Pixtral-style tower, 8580 patches for a 200 dpi page) shows it on every page
+tried: the first NaN appears in the last layer's feed-forward down projection (ffn_out-23),
+whose inputs are finite, and 118 of the 2145 image tokens end up NaN. Running every graph node
+through the eval callback confirms it, as does GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32, which fixes
+the output without this patch. llama.cpp's own graphs already request F32 accumulation where F16
+overflows (kq, and ffn_down for GLM4, GLM4_MOE and JAIS2 in llama-graph.cpp); this does the
+same for every weight matmul the projector builds through clip_graph::build_mm.
+
+It is not specific to the shared ggml-sys build: llama-mtmd-cli built from pristine b11201 with
+its bundled ggml fails identically. Upstream report: not yet filed; no fix on master as of
+95887577 (2026-09-26), and no matching issue or pull request.
+
+Validated against llama.cpp b11201 on an NVIDIA GeForce RTX 5060 Ti (CUDA 13.3, driver 595.84)
+with llama-mtmd-cli, comparing the projector embeddings (MTMD_DEBUG_EMBEDDINGS) with the CPU
+projector's:
+- LightOnOCR-2-1B, a rendered paper page and complex_rotated_scans/rotated_scan_1.jpg: NaN and
+  a degenerate answer before; after, relative L2 error 1.2 % and 2.6 %, no NaN, and the same
+  greedy transcription as the CPU projector. Encoding one page takes 0.9 to 1.0 s instead of
+  9.2 to 11.4 s on 24 CPU threads.
+- Qwen3-VL-2B (F16 projector), which was already finite: relative L2 error 4.7 % before and
+  4.0 % after, the same greedy answer, median encode time 2.1 s before and 2.6 s after (22 s
+  on the CPU).
+Restricting F32 to the feed-forward down projection alone also removes the NaN, but leaves
+up to twice the deviation from the CPU projector (2.3 % and 3.7 %) for about 10 % less encode
+time.
+
+diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
+index 62d146e..4e5e758 100644
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -297,7 +297,14 @@ clip_graph::clip_graph(const clip_graph & parent) :
+ }
+ 
+ ggml_tensor * clip_graph::build_mm(ggml_tensor * w, ggml_tensor * x) const {
+-    return ggml_mul_mat(ctx0, w, x);
++    ggml_tensor * cur = ggml_mul_mat(ctx0, w, x);
++    // Vision towers produce activations beyond the F16 range, most visibly in the feed-forward
++    // down projection of their last layers.
++    // The CUDA backend accumulates F16-weight matmuls in F16 by default, which overflows to inf
++    // and turns the image embeddings into NaN, so request F32 accumulation, which the CPU
++    // backend always uses.
++    ggml_prec_set_acc(cur, GGML_PREC_F32);
++    return cur;
+ }
+ 
+ void clip_graph::cb(ggml_tensor * cur, const char * name, int il) const {

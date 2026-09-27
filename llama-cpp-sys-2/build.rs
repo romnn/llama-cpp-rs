@@ -728,7 +728,9 @@ fn main() {
     if cfg!(feature = "mtmd") {
         bindings_builder = bindings_builder
             .header("wrapper_mtmd.h")
-            .allowlist_item("mtmd_.*");
+            .allowlist_item("mtmd_.*")
+            .allowlist_item("llama_rs_mtmd_.*")
+            .allowlist_item("LLAMA_RS_MTMD_.*");
     }
 
     // Configure Android-specific bindgen settings
@@ -857,6 +859,7 @@ fn main() {
     println!("cargo:rerun-if-changed=wrapper_oai.cpp");
     println!("cargo:rerun-if-changed=wrapper_utils.h");
     println!("cargo:rerun-if-changed=wrapper_mtmd.h");
+    println!("cargo:rerun-if-changed=wrapper_mtmd.cpp");
 
     debug_log!("Bindings Created");
 
@@ -891,6 +894,33 @@ fn main() {
         }
 
         common_wrapper_build.compile("llama_cpp_sys_2_common_wrapper");
+    }
+
+    // The mtmd shims call only into libmtmd and the pristine public headers, so they build
+    // without `common`.
+    if cfg!(feature = "mtmd") {
+        let mut mtmd_wrapper_build = cc::Build::new();
+        mtmd_wrapper_build
+            .cpp(true)
+            .file("wrapper_mtmd.cpp")
+            .include(llama_src.join("include"))
+            .include(llama_src.join("ggml/include"))
+            .flag_if_supported("-std=c++17")
+            .pic(true);
+
+        if matches!(target_os, TargetOs::Windows(WindowsVariant::Msvc)) {
+            mtmd_wrapper_build.flag("/std:c++17");
+        }
+
+        // The C++ standard library is linked explicitly on these targets, as for the common
+        // wrapper above.
+        if matches!(target_os, TargetOs::Apple(_))
+            || (matches!(target_os, TargetOs::Android) && cfg!(feature = "static-stdcxx"))
+        {
+            mtmd_wrapper_build.cpp_link_stdlib(None);
+        }
+
+        mtmd_wrapper_build.compile("llama_cpp_sys_2_mtmd_wrapper");
     }
 
     // Build with Cmake
