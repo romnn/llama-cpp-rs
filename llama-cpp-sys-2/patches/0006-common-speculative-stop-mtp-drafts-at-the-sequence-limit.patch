@@ -1,0 +1,43 @@
+From: Airtype downstream
+Subject: [PATCH] common : stop MTP drafting at the sequence's own draft limit
+
+common_speculative_draft_params::n_max lets a caller cap one sequence's draft below the
+configured maximum, for example to the context or the tokens the request has left. The
+draft-simple implementation ends that sequence's drafting loop once its draft reaches the cap.
+The MTP implementation checks only the configured maximum: it keeps decoding the sequence
+through the draft context and sampling further tokens up to params.n_max, and
+common_speculative_draft then truncates the result to dp.n_max. A caller that asks for one
+draft token out of a configured three pays for three draft steps and gets one token.
+
+The MTP loop now ends a sequence at its own cap, with the same check draft-simple uses. The
+returned drafts are unchanged, since common_speculative_draft truncated them to dp.n_max
+anyway, and a sequence without a cap (-1) or with one at or above params.n_max drafts exactly as
+before. The EAGLE-3 loop checks only params.n_max as well and could take the same change.
+
+Upstream: master as of 2145525a4 (b11201, 2026-09-26) still checks only params.n_max in the MTP
+loop. llama-server caps a slot's draft the same way (server_slot::get_n_draft_max, from the
+slot's remaining context and n_predict), so it wastes the same steps. Drop this patch once the
+pinned release honors dp.n_max in the MTP loop.
+
+Validated against llama.cpp b11201 with Qwen3.5-4B-MTP Q4_K_M on an RTX 5060 Ti (driver 595.84,
+CUDA 13.3). The airtype-desktop-inference-sidecar-engine test
+a_shallow_draft_request_decodes_only_as_deep_as_it_asks counts the draft context's decodes for
+requests of one, two, and three tokens against a configured maximum of three: the unpatched loop
+decodes three times for a one-token request, the patched one once, twice, and three times. The
+engine's speculative suite still matches decoding without speculation, and its decode_throughput
+bench over decoding without speculation measured greedy +28% (unpatched +8%), sampled +45%
+(+40%), four concurrent streams +32% (+31%), and a high temperature, where drafting backs off,
+-1% (-1%).
+
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1695,7 +1695,8 @@
+ 
+                 result.push_back(id);
+ 
+-                if (params.n_max <= (int) result.size()) {
++                if ((params.n_max <= (int) result.size()) ||
++                    (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
+                     drafting[seq_id] = false;
+                     n_drafting--;
+                     continue;

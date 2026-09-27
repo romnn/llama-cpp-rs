@@ -127,6 +127,20 @@ impl LlamaContext<'_> {
         }
     }
 
+    /// Number of recurrent-state snapshots each sequence keeps for rolling back its newest
+    /// positions.
+    ///
+    /// A recurrent or hybrid model can only remove a sequence's tail when this is non-zero, and
+    /// then only as many positions as the snapshots cover, all of them decoded in the sequence's
+    /// most recent batch.
+    /// llama.cpp resolves the requested count to zero for architectures that do not support
+    /// rollback.
+    #[must_use]
+    pub fn n_rs_seq(&self) -> u32 {
+        // SAFETY: A live `LlamaContext` owns a valid context pointer.
+        unsafe { llama_cpp_sys_2::llama_n_rs_seq(self.context.as_ptr()) }
+    }
+
     /// Removes all tokens that do not belong to the specified sequence
     ///
     /// # Parameters
