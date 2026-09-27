@@ -9,6 +9,11 @@ members = [
   "examples/mtmd",
 ]
 
+# Standalone builds resolve `ggml-sys` to an empty placeholder; see its crate docs.
+# A consuming workspace's own `[patch.crates-io]` supplies the real shared ggml instead.
+[patch.crates-io]
+ggml-sys = { path = "ggml-sys-placeholder" }
+
 [workspace.dependencies]
 # core library deps
 thiserror = "2"
