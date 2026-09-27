@@ -1,0 +1,85 @@
+From: Airtype downstream
+Subject: [PATCH] mtmd : plan projector memory without allocating it, and fail allocation gracefully
+
+clip_model_loader::load_tensors allocated the weights buffer even for a no_alloc context, the one
+mtmd_get_memory_usage creates to project a projector's memory, and reserve_compute_meta allocated
+the compute buffers through ggml_backend_sched_reserve either way. Projecting a GPU projector
+therefore briefly held its whole weights and compute buffers on the device, which is the memory the
+projection is meant to find out whether there is room for. When there was none, the weights
+allocation returned NULL, and ggml_backend_buffer_set_usage aborted the process on GGML_ASSERT
+(buffer) rather than letting mtmd_init_from_file return NULL. A real load that runs out of device
+memory aborted the same way (https://github.com/ggml-org/llama.cpp/issues/21402 reports this
+assertion), so a caller had no chance to fall back to the CPU.
+
+For a no_alloc context this points the weights at a zero-size dummy buffer, as
+llama_model::load_tensors does for its own no_alloc loads, and measures the compute buffers with
+ggml_backend_sched_reserve_size, as llama_context does. The per-device totals are unchanged,
+because the weights were already counted tensor by tensor. A failed weights or compute allocation
+now throws, which clip_init and mtmd_init_from_file turn into a NULL context.
+
+The compute projection still covers the warmup image, which some projector types cap below their
+largest input to avoid out-of-memory errors at warmup (set_warmup_n_tokens(256) for Pixtral and
+LightOnOCR), so a full page can need several hundred MiB more at encode time. An encode that cannot
+grow its compute buffer already fails with an error rather than aborting.
+
+Upstream report: not yet filed; master as of 95887577 (2026-09-26) still allocates and asserts.
+
+Validated against llama.cpp b11201 on an NVIDIA GeForce RTX 5060 Ti (CUDA 13.3), on top of
+0002-mtmd-accumulate-projector-matmuls-in-f32.patch:
+- With another process holding most of the device memory, llama-mtmd-cli with Gemma 4 E2B's F16
+  projector aborted in ggml_backend_buffer_set_usage before and now reports "load_tensors: unable
+  to allocate CUDA0 buffer for the weights" and fails to load the projector.
+- mtmd_get_memory_usage reports the same totals for LightOnOCR-2-1B's projector as before (845 MiB
+  on the CPU; 845 MiB on CUDA0 plus 8 MiB on the CPU), in 0.23 s instead of 0.43 s, and the
+  airtype-desktop-inference-sidecar engine's projector parity and footprint tests still pass.
+
+diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
+index 4e5e758..cbc2124 100644
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -3630,7 +3630,21 @@ struct clip_model_loader {
+ 
+             // alloc memory and offload data
+             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
+-            ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
++            if (ctx_clip.no_alloc) {
++                // A memory projection only needs to know where the weights live, so point them at
++                // a dummy buffer the way llama_model::load_tensors does instead of allocating them.
++                ctx_clip.buf.reset(ggml_backend_buft_alloc_buffer(buft, 0));
++                for (ggml_tensor * t = ggml_get_first_tensor(ctx_clip.ctx_data.get()); t != nullptr;
++                        t = ggml_get_next_tensor(ctx_clip.ctx_data.get(), t)) {
++                    t->buffer = ctx_clip.buf.get();
++                }
++            } else {
++                ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
++            }
++            if (!ctx_clip.buf) {
++                throw std::runtime_error(string_format("%s: unable to allocate %s buffer for the weights\n",
++                        __func__, ggml_backend_buft_name(buft)));
++            }
+             ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+             // read the weight from file
+             if (!ctx_clip.no_alloc) {
+@@ -3794,13 +3808,20 @@ struct clip_model_loader {
+     // only initialize backend buffers, but do not allocate them yet
+     static support_info_graph reserve_compute_meta(clip_ctx & ctx_clip, const clip_image_f32_batch & batch) {
+         ggml_cgraph * gf = clip_get_graph_builder(&ctx_clip, batch)->build();
+-        ggml_backend_sched_reserve(ctx_clip.sched.get(), gf);
++        // A memory projection measures the compute buffers without allocating them.
++        std::vector<size_t> projected_sizes(ctx_clip.backend_ptrs.size(), 0);
++        if (ctx_clip.no_alloc) {
++            ggml_backend_sched_reserve_size(ctx_clip.sched.get(), gf, projected_sizes.data());
++        } else if (!ggml_backend_sched_reserve(ctx_clip.sched.get(), gf)) {
++            throw std::runtime_error(string_format("%s: failed to allocate compute buffers\n", __func__));
++        }
+ 
+         ctx_clip.mem_compute.clear();
+         for (size_t i = 0; i < ctx_clip.backend_ptrs.size(); ++i) {
+             ggml_backend_t backend = ctx_clip.backend_ptrs[i];
+             ggml_backend_buffer_type_t buft = ctx_clip.backend_buft[i];
+-            size_t size = ggml_backend_sched_get_buffer_size(ctx_clip.sched.get(), backend);
++            size_t size = ctx_clip.no_alloc ? projected_sizes[i]
++                                            : ggml_backend_sched_get_buffer_size(ctx_clip.sched.get(), backend);
+             if (size > 1) {
+                 LOG_INF("%s: %10s compute buffer size = %8.2f MiB\n", __func__,
+                         ggml_backend_buft_name(buft),

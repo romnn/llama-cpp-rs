@@ -105,6 +105,7 @@ impl<'a> MtmdCliContext<'a> {
         // Initialize MTMD context
         let mtmd_params = MtmdContextParams {
             use_gpu: !params.no_gpu && !params.no_mmproj_offload,
+            device: None,
             print_timings: true,
             n_threads: params.n_threads,
             media_marker: CString::new(

@@ -793,6 +793,33 @@ fn main() {
         common_wrapper_build.compile("llama_cpp_sys_2_common_wrapper");
     }
 
+    // The mtmd shims call only into libmtmd and the pristine public headers, so they build
+    // without `common`.
+    if cfg!(feature = "mtmd") {
+        let mut mtmd_wrapper_build = cc::Build::new();
+        mtmd_wrapper_build
+            .cpp(true)
+            .file("wrapper_mtmd.cpp")
+            .include(llama_src.join("include"))
+            .include(llama_src.join("ggml/include"))
+            .flag_if_supported("-std=c++17")
+            .pic(true);
+
+        if matches!(target_os, TargetOs::Windows(WindowsVariant::Msvc)) {
+            mtmd_wrapper_build.flag("/std:c++17");
+        }
+
+        // The C++ standard library is linked explicitly on these targets, as for the common
+        // wrapper above.
+        if matches!(target_os, TargetOs::Apple(_))
+            || (matches!(target_os, TargetOs::Android) && cfg!(feature = "static-stdcxx"))
+        {
+            mtmd_wrapper_build.cpp_link_stdlib(None);
+        }
+
+        mtmd_wrapper_build.compile("llama_cpp_sys_2_mtmd_wrapper");
+    }
+
     // Build with Cmake
 
     let mut config = Config::new(&llama_build_src);

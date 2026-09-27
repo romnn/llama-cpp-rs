@@ -1,0 +1,99 @@
+From: Airtype downstream
+Subject: [PATCH] mtmd : project the compute buffer one image needs
+
+An encode grows a projector's compute buffers to the graph of the image it encodes, and the
+buffers keep that size. mtmd_get_memory_usage projects them for the warmup image only, which some
+projector types cap well below their largest input (set_warmup_n_tokens(256) for Pixtral and
+LightOnOCR), so a caller that must fit an image into device memory before encoding it has no way
+to learn how much the encode will take. For LightOnOCR-2-1B the warmup projection covers about
+64 MiB while a full page grows the buffers to about 540 MiB.
+
+This adds mtmd_get_chunk_compute_usage, which builds the graph encoding a tokenized image or audio
+chunk would run and measures it with ggml_backend_sched_reserve_size, as reserve_compute_meta
+measures a no_alloc projection, per backend device. It measures on a scheduler of its own and
+allocates nothing, so the context's buffers stay as they are. Measuring on the context's own
+scheduler would not do: when the graph outgrows the buffers, reserve_size frees them but keeps
+the allocation plan, and the next encode, finding the plan current, writes through null buffers.
+The declarations live in the source files because downstream patches may not change headers; the
+llama-cpp-rs shim declares the function itself.
+
+Upstream report: not yet filed; master as of 2145525a (2026-09-27) projects the warmup image only.
+
+The projection covers the compute buffers only. A CUDA encode also takes scratch memory from the
+backend's pool, which nothing projects: on a 2,896 by 2,172 page, 125 MiB beyond LightOnOCR-2-1B's
+515 MiB of buffer growth and 161 MiB beyond Qwen3-VL-2B's 289 MiB.
+
+Validated against llama.cpp b11201 on an NVIDIA GeForce RTX 5060 Ti (CUDA 13.3), on top of
+0002 and 0003: see the airtype-desktop-inference-sidecar engine's projector tests, which reserve
+the projection before each encode, compare it with the device memory the encode takes, and encode
+again after projecting on a context whose buffers have grown.
+
+diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
+index cbc2124..0f4ab8c 100644
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -6127,6 +6127,29 @@ std::map<ggml_backend_dev_t, size_t> clip_get_mem_usage(const struct clip_ctx *
+     return result;
+ }
+ 
++// Projects the compute buffers encoding `imgs` needs on each backend device, measured the way
++// reserve_compute_meta measures a projection, without allocating them. An encode grows the buffers
++// to its graph's size, which the warmup image understates for projectors that cap it. The graph is
++// measured on a scheduler of its own: measuring on the context's scheduler would release the
++// buffers it holds while keeping their allocation plan, which the next encode would then use
++// without buffers.
++std::map<ggml_backend_dev_t, size_t> clip_get_compute_usage(struct clip_ctx * ctx, const clip_image_f32_batch * imgs);
++std::map<ggml_backend_dev_t, size_t> clip_get_compute_usage(struct clip_ctx * ctx, const clip_image_f32_batch * imgs) {
++    ggml_backend_sched_ptr sched(ggml_backend_sched_new(ctx->backend_ptrs.data(), ctx->backend_buft.data(),
++                                                        ctx->backend_ptrs.size(), ctx->max_nodes, false, true));
++    ggml_cgraph * gf = clip_get_graph_builder(ctx, *imgs)->build();
++    std::vector<size_t> sizes(ctx->backend_ptrs.size(), 0);
++    ggml_backend_sched_reserve_size(sched.get(), gf, sizes.data());
++
++    std::map<ggml_backend_dev_t, size_t> result;
++    for (size_t i = 0; i < ctx->backend_ptrs.size(); ++i) {
++        if (sizes[i] > 1) {
++            result[ggml_backend_get_device(ctx->backend_ptrs[i])] += sizes[i];
++        }
++    }
++    return result;
++}
++
+ //
+ // API for debugging
+ //
+diff --git a/tools/mtmd/mtmd.cpp b/tools/mtmd/mtmd.cpp
+index 2efa4d6..7e31ee4 100644
+--- a/tools/mtmd/mtmd.cpp
++++ b/tools/mtmd/mtmd.cpp
+@@ -2701,6 +2701,30 @@ static void stub_log_callback(enum ggml_log_level, const char *, void *) {
+     // do nothing
+ }
+ 
++// Defined in clip.cpp. Declared here because downstream patches may not change clip.h.
++std::map<ggml_backend_dev_t, size_t> clip_get_compute_usage(struct clip_ctx * ctx, const clip_image_f32_batch * imgs);
++
++// Projects the compute buffers encoding `chunk` with `ctx` needs, per backend device, without
++// allocating them. Returns an empty map for a text chunk and when the projection fails.
++MTMD_API std::map<ggml_backend_dev_t, size_t> mtmd_get_chunk_compute_usage(mtmd_context * ctx,
++                                                                         const mtmd_input_chunk * chunk);
++MTMD_API std::map<ggml_backend_dev_t, size_t> mtmd_get_chunk_compute_usage(mtmd_context * ctx,
++                                                                         const mtmd_input_chunk * chunk) {
++    try {
++        if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE && ctx->ctx_v && chunk->tokens_image &&
++                !chunk->tokens_image->is_placeholder()) {
++            return clip_get_compute_usage(ctx->ctx_v, &chunk->tokens_image->batch_f32);
++        }
++        if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO && ctx->ctx_a && chunk->tokens_audio &&
++                !chunk->tokens_audio->is_placeholder()) {
++            return clip_get_compute_usage(ctx->ctx_a, &chunk->tokens_audio->batch_f32);
++        }
++    } catch (const std::exception & e) {
++        LOG_ERR("%s: error: %s\n", __func__, e.what());
++    }
++    return {};
++}
++
+ std::map<ggml_backend_dev_t, size_t> mtmd_get_memory_usage(const char * mmproj_fname,
+                                                             struct mtmd_context_params ctx_params) {
+     mtmd::context_ptr ctx;
