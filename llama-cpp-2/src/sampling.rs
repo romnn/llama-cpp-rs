@@ -8,6 +8,7 @@ use crate::context::LlamaContext;
 use crate::model::LlamaModel;
 #[cfg(feature = "common")]
 use crate::status_is_ok;
+use crate::token::data::LlamaTokenData;
 use crate::token::data_array::LlamaTokenDataArray;
 use crate::token::logit_bias::LlamaLogitBias;
 use crate::token::LlamaToken;
@@ -35,6 +36,51 @@ impl LlamaSampler {
         };
 
         LlamaToken(token)
+    }
+
+    /// Samples and accepts a token from the `idx`-th output of the last evaluation like
+    /// [`Self::sample`], keeping the candidates the chain sampled from in `candidates`.
+    ///
+    /// The kept candidates are the distribution the token was drawn from, which is what
+    /// `common_sampler_get_candidates` exposes to llama.cpp's server for token probabilities.
+    /// Reading log-probabilities off them costs no second pass of the chain over the vocabulary.
+    /// `candidates` is overwritten, reusing its allocation.
+    ///
+    /// Only logits are sampled from: a context whose backend samplers already chose the token has
+    /// no candidates to keep, and is sampled with [`Self::sample`].
+    ///
+    /// Returns `None`, having accepted nothing, when the context holds no logits for `idx` or the
+    /// chain selected no token.
+    pub fn sample_candidates(
+        &mut self,
+        ctx: &LlamaContext,
+        idx: i32,
+        candidates: &mut LlamaTokenDataArray,
+    ) -> Option<LlamaToken> {
+        // SAFETY: A live `LlamaContext` owns a valid context pointer, and llama.cpp returns null
+        // for an output it does not hold.
+        let logits = unsafe { llama_cpp_sys_2::llama_get_logits_ith(ctx.context.as_ptr(), idx) };
+        if logits.is_null() {
+            return None;
+        }
+        let n_vocab = usize::try_from(ctx.model().n_vocab()).ok()?;
+        // SAFETY: A logits row holds one logit per vocabulary token and stays valid until the
+        // context decodes again, which the shared borrow of `ctx` rules out.
+        let logits = unsafe { std::slice::from_raw_parts(logits, n_vocab) };
+
+        candidates.data.clear();
+        candidates.data.extend(
+            (0_i32..)
+                .zip(logits)
+                .map(|(id, logit)| LlamaTokenData::new(LlamaToken(id), *logit, 0.0)),
+        );
+        candidates.selected = None;
+        candidates.sorted = false;
+        candidates.apply_sampler(self);
+
+        let token = candidates.selected_token()?;
+        self.accept(token);
+        Some(token)
     }
 
     /// Applies this sampler to a [`LlamaTokenDataArray`].
@@ -456,8 +502,10 @@ impl LlamaSampler {
             validate_reasoning_budget_inputs(start_tokens, end_sequences, forced_tokens, budget)?;
         // The wrapper takes the end sequences concatenated and delimited by their lengths.
         let end_tokens: Vec<LlamaToken> = end_sequences.concat();
-        let end_sequence_lengths: Vec<usize> =
-            end_sequences.iter().map(|sequence| sequence.len()).collect();
+        let end_sequence_lengths: Vec<usize> = end_sequences
+            .iter()
+            .map(|sequence| sequence.len())
+            .collect();
         // SAFETY: The model owns a live vocabulary, and each non-empty slice remains valid for the
         // duration of the call. The wrapper copies every token before returning.
         let sampler = unsafe {
