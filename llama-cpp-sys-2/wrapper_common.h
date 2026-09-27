@@ -155,36 +155,61 @@ llama_rs_status llama_rs_estimate_memory_breakdown(
     size_t device_capacity,
     size_t * out_device_count);
 
+// Whether the GGUF file at `path` carries multi-token-prediction layers that llama.cpp can draft
+// with, as `common_speculative_types_from_gguf` decides it.
+// False for a file that cannot be read.
+bool llama_rs_model_file_has_mtp_layers(const char * path);
+
+// How the context's memory can remove positions from a sequence, as `common_context_can_seq_rm`
+// classifies it: 0 not at all, 1 any range, 2 whole sequences only, 3 the newest `n_rs_seq`
+// positions.
+// Probing clears the context's memory.
+int32_t llama_rs_context_seq_rm_type(struct llama_context * ctx);
+
+// One sequence's request to `llama_rs_mtp_speculative_draft`.
+struct llama_rs_mtp_draft_request {
+    // Sequence to draft for.
+    llama_seq_id seq_id;
+    // Position the last sampled token takes when the target decodes it.
+    llama_pos pos0;
+    // Last sampled token, which the target has not decoded yet.
+    llama_token id_last;
+    // Most draft tokens for the sequence, at most the drafter's `n_max`.
+    // The drafter stops decoding the sequence at this depth, so a shallower request also takes
+    // fewer draft steps.
+    int32_t n_max;
+};
+
 struct llama_rs_mtp_speculative * llama_rs_mtp_speculative_init(
     struct llama_context * ctx_tgt,
     struct llama_context * ctx_dft,
     int32_t n_max,
     int32_t n_min,
-    float p_min);
+    float p_min,
+    uint32_t n_seq);
 
 void llama_rs_mtp_speculative_free(struct llama_rs_mtp_speculative * spec);
 
-llama_rs_status llama_rs_mtp_speculative_begin(
-    struct llama_rs_mtp_speculative * spec,
-    const llama_token * prompt_tokens,
-    size_t prompt_tokens_count);
+int32_t llama_rs_mtp_speculative_n_max(const struct llama_rs_mtp_speculative * spec);
 
 llama_rs_status llama_rs_mtp_speculative_process(
     struct llama_rs_mtp_speculative * spec,
     const struct llama_batch * batch);
 
+// Drafts for every request in one pass.
+// Request `i` writes its tokens to `out_tokens + i * out_tokens_stride` and their count to
+// `out_tokens_counts[i]`.
 llama_rs_status llama_rs_mtp_speculative_draft(
     struct llama_rs_mtp_speculative * spec,
-    llama_pos n_past,
-    llama_token id_last,
-    const llama_token * prompt_tokens,
-    size_t prompt_tokens_count,
+    const struct llama_rs_mtp_draft_request * requests,
+    size_t requests_count,
     llama_token * out_tokens,
-    size_t out_tokens_capacity,
-    size_t * out_tokens_count);
+    size_t out_tokens_stride,
+    size_t * out_tokens_counts);
 
 llama_rs_status llama_rs_mtp_speculative_accept(
     struct llama_rs_mtp_speculative * spec,
+    llama_seq_id seq_id,
     uint16_t n_accepted);
 
 void llama_rs_chat_template_result_free(struct llama_rs_chat_template_result * result);
