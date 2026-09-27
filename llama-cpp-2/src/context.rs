@@ -267,7 +267,8 @@ impl<'model> LlamaContext<'model> {
         if pooling == llama_cpp_sys_2::LLAMA_POOLING_TYPE_RANK {
             usize::try_from(self.model().n_cls_out()).expect("n_cls_out does not fit into a usize")
         } else {
-            usize::try_from(self.model().n_embd_out()).expect("n_embd_out does not fit into a usize")
+            usize::try_from(self.model().n_embd_out())
+                .expect("n_embd_out does not fit into a usize")
         }
     }
 
