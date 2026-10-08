@@ -106,6 +106,15 @@ impl<'model> LlamaContext<'model> {
         }
     }
 
+    /// Waits for all pending backend work on this context to finish.
+    ///
+    /// Decoding can return before asynchronous backends finish, including when no logits are
+    /// requested or read.
+    pub fn synchronize(&mut self) {
+        // SAFETY: The context owns this live pointer and the mutable borrow excludes other access.
+        unsafe { llama_cpp_sys_2::llama_synchronize(self.context.as_ptr()) }
+    }
+
     /// Returns the model allocation that remains valid for this context's lifetime.
     #[must_use]
     pub fn model(&self) -> &LlamaModel {
