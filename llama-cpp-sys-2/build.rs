@@ -378,6 +378,33 @@ fn is_built_llama_entry(pristine: &Path, entry: &walkdir::DirEntry) -> bool {
 /// build recompiles only what a patch touched, except files that the current or the previous
 /// patch set touches: those get a fresh time, so a file a patch no longer changes is rebuilt from
 /// its pristine contents instead of keeping the object compiled from the patched one.
+/// Exports a digest of `patches`, in the order they apply, as `DEP_LLAMA_PATCHES`.
+///
+/// The submodule revision alone does not name what this build compiled: a patch can change what
+/// llama.cpp allocates without moving it, and a consumer that records measurements against the
+/// revision must not keep them across a patch change. The digest frames each patch's bytes as
+/// ggml-sys frames its own, so both read the same way.
+fn export_patches_digest(patches: &[PathBuf]) {
+    use sha2::{Digest as _, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"patches\0");
+    for patch in patches {
+        let contents = std::fs::read(patch)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", patch.display()));
+        hasher.update(b"\0patch\0");
+        hasher.update(contents.len().to_string().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(&contents);
+    }
+    let digest: String = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    println!("cargo:patches={digest}");
+}
+
 fn prepare_llama_src(pristine: &Path, patches_dir: &Path, out_dir: &Path) -> PathBuf {
     println!("cargo:rerun-if-changed={}", patches_dir.display());
     let mut patches: Vec<PathBuf> = std::fs::read_dir(patches_dir)
@@ -389,10 +416,11 @@ fn prepare_llama_src(pristine: &Path, patches_dir: &Path, out_dir: &Path) -> Pat
                 .collect()
         })
         .unwrap_or_default();
+    patches.sort();
+    export_patches_digest(&patches);
     if patches.is_empty() {
         return pristine.to_path_buf();
     }
-    patches.sort();
 
     let mut stamp = String::new();
     let mut patched_paths = std::collections::BTreeSet::new();
