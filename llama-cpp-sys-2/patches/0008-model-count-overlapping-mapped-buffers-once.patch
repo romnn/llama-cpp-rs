@@ -1,0 +1,102 @@
+From: Airtype downstream
+Subject: [PATCH] model : count the bytes of overlapping mapped buffers once in the memory breakdown
+
+With mmap, llama_model::load_tensors wraps the model files in one mapped buffer per buffer type and
+file, each spanning from the first to the last tensor of that buffer type, and
+llama_model::memory_breakdown reports the size of each window. Where the tensors of two buffer
+types interleave in a file, their windows overlap, and the breakdown counts the shared bytes once
+per window. On Apple Silicon the Metal device maps the files as well (MTL0_Mapped), so a model with
+CPU-resident tensors between offloaded ones reports far more weights than its files hold: Gemma 4
+E2B Q8_0, a 4737 MiB file whose per-layer token embeddings stay on the CPU, reports
+CPU_Mapped 2788 MiB plus MTL0_Mapped 4722 MiB, 7510 MiB in all. The pages are the same, so a caller
+that budgets unified memory from the breakdown charges the weights more than once and refuses
+loads that fit.
+
+memory_breakdown now counts each byte of a mapped buffer once, attributing it to the first buffer
+type that maps it, by taking the union of the mapped address ranges. Allocated buffers are counted
+as before, and so is the no_alloc projection, which sums tensors rather than windows. Backends that
+copy the weights into buffers of their own, such as CUDA, map one window per file, so nothing
+changes for them.
+
+Upstream report: not yet filed; master as of efe3626b (2026-10-12) still sums the windows.
+
+Validated against llama.cpp b11201 on an Apple M3 Pro (Metal, 36 GB unified memory), through the
+breakdown llama_get_memory_breakdown reports for a loaded context:
+- Llama 3.2 3B Instruct Q4_K_M, a 2019 MB file with all layers offloaded: its token embeddings stay
+  on the CPU while the tied output layer maps the same tensor into the Metal window, and the
+  weights came to 323 MB of CPU_Mapped plus 2012 MB of MTL0_Mapped, 2335 MB in all, before the
+  patch and no more than the file after it. The airtype-desktop-inference-sidecar-engine test
+  llm::tests::gpu::the_weights_on_metal_are_charged_once_for_each_byte_of_the_file checks this.
+- Gemma 4 E2B Q8_0, the 4737 MiB file above, fully offloaded with a 4096-token context and its
+  projector: the Airtype desktop app measured its loaded footprint at 9.80 GB before the patch,
+  over its 9.66 GB unified-memory budget, so it refused to serve the model, and at 6.83 GB after
+  it, which it serves.
+
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index ab5e744..e4a2cae 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1204,6 +1204,9 @@ struct llama_model::impl {
+     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
+     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
+ 
++    // the buffers among ctxs_bufs that map a range of the model files instead of allocating memory
++    std::vector<ggml_backend_buffer_t> mapped_bufs;
++
+     buft_list_t cpu_buft_list;
+     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
+ 
+@@ -1860,6 +1863,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+                 }
+                 bufs.emplace_back(buf);
+                 buf_map.emplace(idx, buf);
++                pimpl->mapped_bufs.push_back(buf);
+             }
+         } else {
+             ggml_backend_buffer_t buf;
+@@ -1997,8 +2001,28 @@ llama_split_mode llama_model::split_mode() const {
+     return params.split_mode;
+ }
+ 
++// the number of bytes the address ranges [first, last) cover, each counted once
++static size_t llama_ranges_union_size(std::vector<std::pair<uintptr_t, uintptr_t>> ranges) {
++    std::sort(ranges.begin(), ranges.end());
++    size_t   total   = 0;
++    uintptr_t covered = 0; // the end of the ranges counted so far
++    for (const auto & [first, last] : ranges) {
++        const uintptr_t begin = std::max(first, covered);
++        if (last > begin) {
++            total  += last - begin;
++            covered = last;
++        }
++    }
++    return total;
++}
++
+ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
+     std::map<ggml_backend_buffer_type_t, size_t> ret;
++    // each mapped buffer is a window onto the model files, sized to span the tensors of its buffer
++    // type, so the windows of two buffer types overlap wherever their tensors interleave in a file:
++    // with Metal mapping the files as well, the windows of a model can add up to more than the
++    // files themselves; a mapped byte is counted once, for the first buffer type that maps it
++    std::vector<std::pair<uintptr_t, uintptr_t>> mapped_ranges;
+     for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+         if (hparams.no_alloc) {
+             GGML_ASSERT(bufs.size() == 1);
+@@ -2009,7 +2033,15 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
+         } else {
+             for (const auto & buf : bufs) {
+                 // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
+-                ret[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
++                size_t size = ggml_backend_buffer_get_size(buf.get());
++                const auto & mapped = pimpl->mapped_bufs;
++                if (std::find(mapped.begin(), mapped.end(), buf.get()) != mapped.end()) {
++                    const size_t    counted = llama_ranges_union_size(mapped_ranges);
++                    const uintptr_t first   = (uintptr_t) ggml_backend_buffer_get_base(buf.get());
++                    mapped_ranges.emplace_back(first, first + size);
++                    size = llama_ranges_union_size(mapped_ranges) - counted;
++                }
++                ret[ggml_backend_buffer_get_type(buf.get())] += size;
+             }
+         }
+     }
