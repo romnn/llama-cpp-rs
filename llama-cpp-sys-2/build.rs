@@ -1818,10 +1818,13 @@ fn main() {
                 replace_with_hard_link(&asset, &dst);
             }
 
-            // Copy DLLs to target/profile/deps as well for tests
-            let dst = target_dir.join("deps").join(filename);
-            debug_log!("HARD LINK {} TO {}", asset.display(), dst.display());
-            replace_with_hard_link(&asset, &dst);
+            // Copy DLLs to target/profile/deps as well for tests, where the layout has one.
+            // Cargo's package-scoped build directory layout does not.
+            if target_dir.join("deps").exists() {
+                let dst = target_dir.join("deps").join(filename);
+                debug_log!("HARD LINK {} TO {}", asset.display(), dst.display());
+                replace_with_hard_link(&asset, &dst);
+            }
         }
     }
 }
