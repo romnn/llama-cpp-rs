@@ -7,6 +7,7 @@
 //! This API is experimental and subject to breaking changes.
 use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
+use std::ptr::NonNull;
 use std::slice;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
@@ -209,7 +210,7 @@ pub struct MtmdInputText {
 /// A tokenization or decode on another thread proceeds while an encode runs.
 #[derive(Debug)]
 pub struct MtmdContext {
-    pub(crate) context: Ptr<llama_cpp_sys_2::mtmd_context>,
+    pub(crate) context: NonNull<llama_cpp_sys_2::mtmd_context>,
     /// Width of one output embedding row, the text model's input embedding width, which
     /// `mtmd_init_from_file` checks the projector against.
     embedding_width: usize,
@@ -263,7 +264,7 @@ impl MtmdContext {
             )
         };
 
-        let context = Ptr::new(context).ok_or(MtmdInitError::NullResult)?;
+        let context = NonNull::new(context).ok_or(MtmdInitError::NullResult)?;
         // SAFETY: `text_model` holds a loaded model for the duration of the borrow.
         let embedding_width =
             unsafe { llama_cpp_sys_2::llama_model_n_embd_inp(text_model.model.as_ptr()) };
@@ -546,7 +547,7 @@ impl MtmdContext {
         // SAFETY: the context and the chunk are live for the duration of the call, and the
         // caller's compute lock keeps every other writer of the context out.
         let result = unsafe {
-            llama_cpp_sys_2::mtmd_encode_chunk(self.context.as_mut_ptr(), chunk.chunk.as_ptr())
+            llama_cpp_sys_2::mtmd_encode_chunk(self.context.as_ptr(), chunk.chunk.as_ptr())
         };
 
         if result == 0 {
@@ -609,7 +610,7 @@ fn unregistered_device(params: &MtmdContextParams) -> Option<UnregisteredDevice>
 
 impl Drop for MtmdContext {
     fn drop(&mut self) {
-        unsafe { llama_cpp_sys_2::mtmd_free(self.context.as_mut_ptr()) }
+        unsafe { llama_cpp_sys_2::mtmd_free(self.context.as_ptr()) }
     }
 }
 
@@ -902,11 +903,6 @@ pub struct MtmdInputChunks {
     chunks: Ptr<llama_cpp_sys_2::mtmd_input_chunks>,
 }
 
-// SAFETY: `mtmd_input_chunks` is thread-safe, it's just a list of chunks.
-unsafe impl Send for MtmdInputChunks {}
-// SAFETY: Same as above.
-unsafe impl Sync for MtmdInputChunks {}
-
 impl Default for MtmdInputChunks {
     fn default() -> Self {
         Self::new()
@@ -1046,7 +1042,7 @@ impl MtmdInputChunks {
         let _compute = mtmd_ctx.lock_compute();
         let result = unsafe {
             llama_cpp_sys_2::mtmd_helper_eval_chunks(
-                mtmd_ctx.context.as_mut_ptr(),
+                mtmd_ctx.context.as_ptr(),
                 llama_ctx.context.as_mut_ptr(),
                 self.chunks.as_ptr(),
                 n_past,
@@ -1210,7 +1206,7 @@ impl MtmdInputChunk<'_> {
         let result = unsafe {
             llama_cpp_sys_2::mtmd_helper_eval_chunk_single(
                 mtmd_ctx.context.as_ptr(),
-                llama_ctx.context.as_ptr(),
+                llama_ctx.context.as_mut_ptr(),
                 self.chunk.as_ptr(),
                 n_past,
                 seq_id,
@@ -1267,7 +1263,7 @@ impl MtmdInputChunk<'_> {
         // SAFETY: the context holds a loaded model for as long as it lives.
         let embedding_width = unsafe {
             llama_cpp_sys_2::llama_model_n_embd_inp(llama_cpp_sys_2::llama_get_model(
-                llama_ctx.context.as_ptr(),
+                llama_ctx.context.as_mut_ptr(),
             ))
         };
         let expected = self
@@ -1286,7 +1282,7 @@ impl MtmdInputChunk<'_> {
         let result = unsafe {
             llama_cpp_sys_2::mtmd_helper_decode_image_chunk(
                 mtmd_ctx.context.as_ptr(),
-                llama_ctx.context.as_ptr(),
+                llama_ctx.context.as_mut_ptr(),
                 self.chunk.as_ptr(),
                 embeddings.as_ptr().cast_mut(),
                 n_past,

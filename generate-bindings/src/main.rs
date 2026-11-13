@@ -87,9 +87,13 @@ fn main() {
         (llama.join("include/llama.h"), "ggml.rs", "ggml_.*"),
         (llama.join("ggml/include/gguf.h"), "gguf.rs", "gguf_.*"),
         (llama.join("include/llama.h"), "llama.rs", "llama_.*"),
-        (llama.join("tools/mtmd/mtmd-helper.h"), "mtmd.rs", "mtmd_.*"),
+        (
+            sys.join("wrapper_mtmd.h"),
+            "mtmd.rs",
+            "(mtmd_.*|llama_rs_mtmd_.*|LLAMA_RS_MTMD_.*)",
+        ),
         // The `llama_rs_*` symbols are emitted by `wrapper_common.cpp`.
-        (sys.join("wrapper_common.h"), "common.rs", "llama_rs_.*"),
+        (sys.join("wrapper_oai.h"), "common.rs", "llama_rs_.*"),
     ];
 
     for (header, output, allowlist_item) in headers {

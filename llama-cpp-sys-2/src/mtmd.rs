@@ -409,6 +409,7 @@ pub const MTMD_GEN_AUDIO_TYPE_POCKETTTS: mtmd_gen_audio_type = 2;
 pub const MTMD_GEN_AUDIO_TYPE_SOPRANO: mtmd_gen_audio_type = 3;
 pub const MTMD_GEN_AUDIO_TYPE_LFM3A: mtmd_gen_audio_type = 4;
 pub const MTMD_GEN_AUDIO_TYPE_CHATTERBOX: mtmd_gen_audio_type = 5;
+pub const MTMD_GEN_AUDIO_TYPE_DRAMA3: mtmd_gen_audio_type = 6;
 pub type mtmd_gen_audio_type = UnsignedEnum;
 #[repr(C)]
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -561,6 +562,25 @@ extern "C" {
         placeholder: bool,
         opt: mtmd_helper_init_opt,
     ) -> mtmd_helper_bitmap_wrapper;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct mtmd_helper_resampler {
+    _unused: [u8; 0],
+}
+extern "C" {
+    pub fn mtmd_helper_resampler_init(rate_in: i32, rate_out: i32) -> *mut mtmd_helper_resampler;
+}
+extern "C" {
+    pub fn mtmd_helper_resampler_free(ctx: *mut mtmd_helper_resampler);
+}
+extern "C" {
+    pub fn mtmd_helper_resampler_process(
+        ctx: *mut mtmd_helper_resampler,
+        in_: *const f32,
+        n_in: usize,
+        out: *mut *const f32,
+    ) -> i64;
 }
 extern "C" {
     pub fn mtmd_helper_get_n_tokens(chunks: *const mtmd_input_chunks) -> usize;
@@ -718,6 +738,7 @@ pub struct mtmd_helper_gen_audio_inp {
     pub lang: *const ::std::os::raw::c_char,
     pub top_k: i32,
     pub top_p: f32,
+    pub temp: f32,
     pub seed: u32,
     pub out_type: mtmd_helper_gen_audio_outtype,
 }
@@ -782,4 +803,34 @@ extern "C" {
 }
 extern "C" {
     pub fn mtmd_helper_gen_audio_flush(ctx: *mut mtmd_helper_gen_audio) -> i32;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct llama_rs_mtmd_device_memory {
+    pub device_index: usize,
+    pub bytes: usize,
+}
+pub const LLAMA_RS_MTMD_STATUS_OK: llama_rs_mtmd_status = 0;
+pub const LLAMA_RS_MTMD_STATUS_INVALID_ARGUMENT: llama_rs_mtmd_status = -1;
+pub const LLAMA_RS_MTMD_STATUS_PROJECTION_FAILED: llama_rs_mtmd_status = -2;
+pub const LLAMA_RS_MTMD_STATUS_CAPACITY_EXCEEDED: llama_rs_mtmd_status = -3;
+pub const LLAMA_RS_MTMD_STATUS_UNKNOWN_DEVICE: llama_rs_mtmd_status = -4;
+pub type llama_rs_mtmd_status = SignedEnum;
+extern "C" {
+    pub fn llama_rs_mtmd_estimate_memory_usage(
+        mmproj_path: *const ::std::os::raw::c_char,
+        params: *const mtmd_context_params,
+        out_devices: *mut llama_rs_mtmd_device_memory,
+        device_capacity: usize,
+        out_device_count: *mut usize,
+    ) -> llama_rs_mtmd_status;
+}
+extern "C" {
+    pub fn llama_rs_mtmd_chunk_compute_usage(
+        ctx: *mut mtmd_context,
+        chunk: *const mtmd_input_chunk,
+        out_devices: *mut llama_rs_mtmd_device_memory,
+        device_capacity: usize,
+        out_device_count: *mut usize,
+    ) -> llama_rs_mtmd_status;
 }

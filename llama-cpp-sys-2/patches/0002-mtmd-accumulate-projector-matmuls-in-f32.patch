@@ -34,23 +34,20 @@ Restricting F32 to the feed-forward down projection alone also removes the NaN, 
 up to twice the deviation from the CPU projector (2.3 % and 3.7 %) for about 10 % less encode
 time.
 
-diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
-index 62d146e..4e5e758 100644
---- a/tools/mtmd/clip.cpp
-+++ b/tools/mtmd/clip.cpp
-@@ -297,7 +297,14 @@ clip_graph::clip_graph(const clip_graph & parent) :
+Refreshed for b12332: clip_graph is now mtmd_graph; the accumulation rule is unchanged.
+
+diff --git a/tools/mtmd/mtmd-graph.cpp b/tools/mtmd/mtmd-graph.cpp
+--- a/tools/mtmd/mtmd-graph.cpp
++++ b/tools/mtmd/mtmd-graph.cpp
+@@ -67,7 +67,10 @@
  }
- 
- ggml_tensor * clip_graph::build_mm(ggml_tensor * w, ggml_tensor * x) const {
+
+ ggml_tensor * mtmd_graph::build_mm(ggml_tensor * w, ggml_tensor * x) const {
 -    return ggml_mul_mat(ctx0, w, x);
 +    ggml_tensor * cur = ggml_mul_mat(ctx0, w, x);
-+    // Vision towers produce activations beyond the F16 range, most visibly in the feed-forward
-+    // down projection of their last layers.
-+    // The CUDA backend accumulates F16-weight matmuls in F16 by default, which overflows to inf
-+    // and turns the image embeddings into NaN, so request F32 accumulation, which the CPU
-+    // backend always uses.
++    // F16 accumulation overflows on vision activations; the CPU already accumulates in F32.
 +    ggml_prec_set_acc(cur, GGML_PREC_F32);
 +    return cur;
  }
- 
- void clip_graph::cb(ggml_tensor * cur, const char * name, int il) const {
+
+ void mtmd_graph::cb(ggml_tensor * cur, const char * name, int il) const {

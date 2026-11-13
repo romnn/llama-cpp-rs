@@ -81,7 +81,7 @@ llama_rs_status llama_rs_chat_parse_to_oaicompat(
     bool is_partial,
     int chat_format,
     bool parse_tool_calls,
-    const char * parser_data,
+    const struct llama_rs_chat_syntax * parser_data,
     const char * generation_prompt,
     struct llama_rs_chat_msg_oaicompat * out_msg);
 
@@ -102,7 +102,7 @@ struct llama_rs_chat_msg_diff_oaicompat {
     char * tool_call_id;
 };
 
-// Parses the responses of one chat template: the serialized parser is loaded once, and the
+// Parses the responses of one chat template: the native syntax is copied once, and the
 // streamed response so far is kept to report what each update changed.
 struct llama_rs_chat_parser;
 
@@ -111,7 +111,7 @@ struct llama_rs_chat_parser;
 llama_rs_status llama_rs_chat_parser_init(
     int chat_format,
     bool parse_tool_calls,
-    const char * parser_data,
+    const struct llama_rs_chat_syntax * parser_data,
     const char * generation_prompt,
     struct llama_rs_chat_parser ** out_parser);
 

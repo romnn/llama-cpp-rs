@@ -7,16 +7,92 @@ use crate::*;
 pub struct llama_rs_mtp_speculative {
     _unused: [u8; 0],
 }
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct llama_rs_grammar_trigger {
+    pub type_: ::std::os::raw::c_int,
+    pub value: *mut ::std::os::raw::c_char,
+    pub token: llama_token,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct llama_rs_chat_syntax {
+    _unused: [u8; 0],
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct llama_rs_chat_template_result {
+    pub prompt: *mut ::std::os::raw::c_char,
+    pub grammar: *mut ::std::os::raw::c_char,
+    pub parser: *mut llama_rs_chat_syntax,
+    pub generation_prompt: *mut ::std::os::raw::c_char,
+    pub thinking_start_tag: *mut ::std::os::raw::c_char,
+    pub thinking_end_tags: *mut *mut ::std::os::raw::c_char,
+    pub thinking_end_tags_count: usize,
+    pub supports_thinking: bool,
+    pub chat_format: ::std::os::raw::c_int,
+    pub grammar_lazy: bool,
+    pub grammar_triggers: *mut llama_rs_grammar_trigger,
+    pub grammar_triggers_count: usize,
+    pub preserved_tokens: *mut *mut ::std::os::raw::c_char,
+    pub preserved_tokens_count: usize,
+    pub additional_stops: *mut *mut ::std::os::raw::c_char,
+    pub additional_stops_count: usize,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct llama_rs_chat_template_caps {
+    pub supports_tools: bool,
+    pub supports_tool_calls: bool,
+    pub supports_system_role: bool,
+    pub supports_parallel_tool_calls: bool,
+    pub supports_preserve_reasoning: bool,
+    pub supports_thinking: bool,
+    pub supports_string_content: bool,
+    pub supports_typed_content: bool,
+    pub supports_object_arguments: bool,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct llama_rs_memory_usage {
+    pub model_bytes: usize,
+    pub context_bytes: usize,
+    pub compute_bytes: usize,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct llama_rs_device_memory_usage {
+    pub device_index: usize,
+    pub usage: llama_rs_memory_usage,
+}
 pub const LLAMA_RS_STATUS_OK: llama_rs_status = 0;
 pub const LLAMA_RS_STATUS_INVALID_ARGUMENT: llama_rs_status = -1;
 pub const LLAMA_RS_STATUS_ALLOCATION_FAILED: llama_rs_status = -2;
 pub const LLAMA_RS_STATUS_EXCEPTION: llama_rs_status = -3;
 pub type llama_rs_status = SignedEnum;
 extern "C" {
+    pub fn llama_rs_chat_syntax_free(syntax: *mut llama_rs_chat_syntax);
+}
+extern "C" {
     pub fn llama_rs_json_schema_to_grammar(
         schema_json: *const ::std::os::raw::c_char,
         force_gbnf: bool,
         out_grammar: *mut *mut ::std::os::raw::c_char,
+    ) -> llama_rs_status;
+}
+extern "C" {
+    pub fn llama_rs_chat_template_get_caps(
+        model: *const llama_model,
+        chat_template: *const ::std::os::raw::c_char,
+        out_caps: *mut llama_rs_chat_template_caps,
+    ) -> llama_rs_status;
+}
+extern "C" {
+    pub fn llama_rs_backend_load_all();
+}
+extern "C" {
+    pub fn llama_rs_backend_load_all_from_path(
+        dir_path: *const ::std::os::raw::c_char,
     ) -> llama_rs_status;
 }
 extern "C" {
@@ -49,6 +125,19 @@ extern "C" {
     ) -> *mut llama_sampler;
 }
 extern "C" {
+    pub fn llama_rs_sampler_init_reasoning_budget(
+        vocab: *const llama_vocab,
+        start_tokens: *const llama_token,
+        start_tokens_count: usize,
+        end_tokens: *const llama_token,
+        end_sequence_lengths: *const usize,
+        end_sequences_count: usize,
+        forced_tokens: *const llama_token,
+        forced_tokens_count: usize,
+        budget: i32,
+    ) -> *mut llama_sampler;
+}
+extern "C" {
     pub fn llama_rs_sampler_accept(
         sampler: *mut llama_sampler,
         token: llama_token,
@@ -71,23 +160,56 @@ extern "C" {
     pub fn llama_rs_memory_breakdown_print(ctx: *const llama_context);
 }
 extern "C" {
+    pub fn llama_rs_get_memory_breakdown(
+        ctx: *const llama_context,
+        out_host: *mut llama_rs_memory_usage,
+        out_unattributed: *mut llama_rs_memory_usage,
+        out_devices: *mut llama_rs_device_memory_usage,
+        device_capacity: usize,
+        out_device_count: *mut usize,
+    ) -> llama_rs_status;
+}
+extern "C" {
+    pub fn llama_rs_estimate_memory_breakdown(
+        model_path: *const ::std::os::raw::c_char,
+        model_params: *const llama_model_params,
+        context_params: *const llama_context_params,
+        out_host: *mut llama_rs_memory_usage,
+        out_unattributed: *mut llama_rs_memory_usage,
+        out_devices: *mut llama_rs_device_memory_usage,
+        device_capacity: usize,
+        out_device_count: *mut usize,
+    ) -> llama_rs_status;
+}
+extern "C" {
+    pub fn llama_rs_model_file_has_mtp_layers(path: *const ::std::os::raw::c_char) -> bool;
+}
+extern "C" {
+    pub fn llama_rs_context_seq_rm_type(ctx: *mut llama_context) -> i32;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct llama_rs_mtp_draft_request {
+    pub seq_id: llama_seq_id,
+    pub pos0: llama_pos,
+    pub id_last: llama_token,
+    pub n_max: i32,
+}
+extern "C" {
     pub fn llama_rs_mtp_speculative_init(
         ctx_tgt: *mut llama_context,
         ctx_dft: *mut llama_context,
         n_max: i32,
         n_min: i32,
         p_min: f32,
+        n_seq: u32,
     ) -> *mut llama_rs_mtp_speculative;
 }
 extern "C" {
     pub fn llama_rs_mtp_speculative_free(spec: *mut llama_rs_mtp_speculative);
 }
 extern "C" {
-    pub fn llama_rs_mtp_speculative_begin(
-        spec: *mut llama_rs_mtp_speculative,
-        prompt_tokens: *const llama_token,
-        prompt_tokens_count: usize,
-    ) -> llama_rs_status;
+    pub fn llama_rs_mtp_speculative_n_max(spec: *const llama_rs_mtp_speculative) -> i32;
 }
 extern "C" {
     pub fn llama_rs_mtp_speculative_process(
@@ -98,21 +220,152 @@ extern "C" {
 extern "C" {
     pub fn llama_rs_mtp_speculative_draft(
         spec: *mut llama_rs_mtp_speculative,
-        n_past: llama_pos,
-        id_last: llama_token,
-        prompt_tokens: *const llama_token,
-        prompt_tokens_count: usize,
+        requests: *const llama_rs_mtp_draft_request,
+        requests_count: usize,
         out_tokens: *mut llama_token,
-        out_tokens_capacity: usize,
-        out_tokens_count: *mut usize,
+        out_tokens_stride: usize,
+        out_tokens_counts: *mut usize,
     ) -> llama_rs_status;
 }
 extern "C" {
     pub fn llama_rs_mtp_speculative_accept(
         spec: *mut llama_rs_mtp_speculative,
+        seq_id: llama_seq_id,
         n_accepted: u16,
     ) -> llama_rs_status;
 }
 extern "C" {
+    pub fn llama_rs_chat_template_result_free(result: *mut llama_rs_chat_template_result);
+}
+extern "C" {
     pub fn llama_rs_string_free(ptr: *mut ::std::os::raw::c_char);
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct llama_rs_chat_msg_content_part_oaicompat {
+    pub type_: *mut ::std::os::raw::c_char,
+    pub text: *mut ::std::os::raw::c_char,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct llama_rs_tool_call_oaicompat {
+    pub name: *mut ::std::os::raw::c_char,
+    pub arguments: *mut ::std::os::raw::c_char,
+    pub id: *mut ::std::os::raw::c_char,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct llama_rs_chat_msg_oaicompat {
+    pub role: *mut ::std::os::raw::c_char,
+    pub content: *mut ::std::os::raw::c_char,
+    pub content_parts: *mut llama_rs_chat_msg_content_part_oaicompat,
+    pub content_parts_count: usize,
+    pub reasoning_content: *mut ::std::os::raw::c_char,
+    pub tool_name: *mut ::std::os::raw::c_char,
+    pub tool_call_id: *mut ::std::os::raw::c_char,
+    pub tool_calls: *mut llama_rs_tool_call_oaicompat,
+    pub tool_calls_count: usize,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct llama_rs_chat_template_oaicompat_params {
+    pub messages: *const ::std::os::raw::c_char,
+    pub tools: *const ::std::os::raw::c_char,
+    pub tool_choice: *const ::std::os::raw::c_char,
+    pub json_schema: *const ::std::os::raw::c_char,
+    pub grammar: *const ::std::os::raw::c_char,
+    pub reasoning_format: *const ::std::os::raw::c_char,
+    pub chat_template_kwargs: *const ::std::os::raw::c_char,
+    pub add_generation_prompt: bool,
+    pub use_jinja: bool,
+    pub parallel_tool_calls: bool,
+    pub enable_thinking: bool,
+    pub add_bos: bool,
+    pub add_eos: bool,
+}
+extern "C" {
+    pub fn llama_rs_apply_chat_template_with_tools_oaicompat(
+        model: *const llama_model,
+        chat_template: *const ::std::os::raw::c_char,
+        messages: *const llama_chat_message,
+        message_count: usize,
+        tools_json: *const ::std::os::raw::c_char,
+        json_schema: *const ::std::os::raw::c_char,
+        reasoning_format: *const ::std::os::raw::c_char,
+        enable_thinking: bool,
+        add_generation_prompt: bool,
+        out_result: *mut llama_rs_chat_template_result,
+    ) -> llama_rs_status;
+}
+extern "C" {
+    pub fn llama_rs_apply_chat_template_oaicompat(
+        model: *const llama_model,
+        chat_template: *const ::std::os::raw::c_char,
+        params: *const llama_rs_chat_template_oaicompat_params,
+        out_result: *mut llama_rs_chat_template_result,
+    ) -> llama_rs_status;
+}
+extern "C" {
+    pub fn llama_rs_chat_parse_to_oaicompat(
+        input: *const ::std::os::raw::c_char,
+        is_partial: bool,
+        chat_format: ::std::os::raw::c_int,
+        parse_tool_calls: bool,
+        parser_data: *const llama_rs_chat_syntax,
+        generation_prompt: *const ::std::os::raw::c_char,
+        out_msg: *mut llama_rs_chat_msg_oaicompat,
+    ) -> llama_rs_status;
+}
+extern "C" {
+    pub fn llama_rs_chat_msg_free_oaicompat(msg: *mut llama_rs_chat_msg_oaicompat);
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct llama_rs_chat_msg_diff_oaicompat {
+    pub reasoning_content_delta: *mut ::std::os::raw::c_char,
+    pub content_delta: *mut ::std::os::raw::c_char,
+    pub tool_call_index: usize,
+    pub tool_call_name: *mut ::std::os::raw::c_char,
+    pub tool_call_arguments: *mut ::std::os::raw::c_char,
+    pub tool_call_id: *mut ::std::os::raw::c_char,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct llama_rs_chat_parser {
+    _unused: [u8; 0],
+}
+extern "C" {
+    pub fn llama_rs_chat_parser_init(
+        chat_format: ::std::os::raw::c_int,
+        parse_tool_calls: bool,
+        parser_data: *const llama_rs_chat_syntax,
+        generation_prompt: *const ::std::os::raw::c_char,
+        out_parser: *mut *mut llama_rs_chat_parser,
+    ) -> llama_rs_status;
+}
+extern "C" {
+    pub fn llama_rs_chat_parser_free(parser: *mut llama_rs_chat_parser);
+}
+extern "C" {
+    pub fn llama_rs_chat_parser_parse(
+        parser: *const llama_rs_chat_parser,
+        input: *const ::std::os::raw::c_char,
+        is_partial: bool,
+        out_msg: *mut llama_rs_chat_msg_oaicompat,
+    ) -> llama_rs_status;
+}
+extern "C" {
+    pub fn llama_rs_chat_parser_update(
+        parser: *mut llama_rs_chat_parser,
+        text_added: *const ::std::os::raw::c_char,
+        is_partial: bool,
+        out_diffs: *mut *mut llama_rs_chat_msg_diff_oaicompat,
+        out_diffs_count: *mut usize,
+    ) -> llama_rs_status;
+}
+extern "C" {
+    pub fn llama_rs_chat_msg_diffs_free_oaicompat(
+        diffs: *mut llama_rs_chat_msg_diff_oaicompat,
+        count: usize,
+    );
 }

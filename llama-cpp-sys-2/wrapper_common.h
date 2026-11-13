@@ -16,10 +16,12 @@ struct llama_rs_grammar_trigger {
     llama_token token;
 };
 
+struct llama_rs_chat_syntax;
+
 struct llama_rs_chat_template_result {
     char * prompt;
     char * grammar;
-    char * parser;
+    struct llama_rs_chat_syntax * parser;
     char * generation_prompt;
     char * thinking_start_tag;
     char ** thinking_end_tags;
@@ -63,6 +65,8 @@ struct llama_rs_device_memory_usage {
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+void llama_rs_chat_syntax_free(struct llama_rs_chat_syntax * syntax);
 
 llama_rs_status llama_rs_json_schema_to_grammar(
     const char * schema_json,

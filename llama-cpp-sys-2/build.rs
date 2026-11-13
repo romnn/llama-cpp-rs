@@ -8,6 +8,8 @@ use cmake::Config;
 use glob::glob;
 use walkdir::DirEntry;
 
+mod build_support;
+
 enum WindowsVariant {
     Msvc,
     Other,
@@ -86,16 +88,6 @@ fn parse_target_os() -> Result<(TargetOs, String), String> {
     } else {
         Err(target)
     }
-}
-
-fn get_cargo_target_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let out_dir = env::var("OUT_DIR")?;
-    let path = PathBuf::from(out_dir);
-    let target_dir = path
-        .ancestors()
-        .nth(3)
-        .ok_or("OUT_DIR is not deep enough")?;
-    Ok(target_dir.to_path_buf())
 }
 
 /// Filename prefix used for libraries on this platform.
@@ -425,6 +417,38 @@ fn is_built_llama_entry(pristine: &Path, entry: &walkdir::DirEntry) -> bool {
             .is_some_and(|name| UNBUILT_LLAMA_ENTRIES.contains(&name)))
 }
 
+/// A patch from `patches/`, read once so that what is hashed, stamped, checked, and applied are
+/// the same bytes even if the file changes while the build runs.
+struct Patch {
+    path: PathBuf,
+    contents: String,
+}
+
+/// Exports a digest of `patches`, in the order they apply, as `DEP_LLAMA_PATCHES`.
+///
+/// The submodule revision alone does not name what this build compiled: a patch can change what
+/// llama.cpp allocates without moving it, and a consumer that records measurements against the
+/// revision must not keep them across a patch change. The digest frames each patch's bytes as
+/// ggml-sys frames its own, so both read the same way.
+fn export_patches_digest(patches: &[Patch]) {
+    use sha2::{Digest as _, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"patches\0");
+    for patch in patches {
+        hasher.update(b"\0patch\0");
+        hasher.update(patch.contents.len().to_string().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(patch.contents.as_bytes());
+    }
+    let digest: String = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    println!("cargo:patches={digest}");
+}
+
 /// Returns the llama.cpp tree for CMake to compile: the pristine submodule when `patches/` holds
 /// no patches, otherwise a copy in `OUT_DIR` with every `patches/*.patch` applied in file-name
 /// order. Patches may change sources but not headers.
@@ -437,7 +461,7 @@ fn is_built_llama_entry(pristine: &Path, entry: &walkdir::DirEntry) -> bool {
 /// its pristine contents instead of keeping the object compiled from the patched one.
 fn prepare_llama_src(pristine: &Path, patches_dir: &Path, out_dir: &Path) -> PathBuf {
     println!("cargo:rerun-if-changed={}", patches_dir.display());
-    let mut patches: Vec<PathBuf> = std::fs::read_dir(patches_dir)
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(patches_dir)
         .map(|entries| {
             entries
                 .filter_map(Result::ok)
@@ -446,27 +470,38 @@ fn prepare_llama_src(pristine: &Path, patches_dir: &Path, out_dir: &Path) -> Pat
                 .collect()
         })
         .unwrap_or_default();
+    paths.sort();
+    let patches: Vec<Patch> = paths
+        .into_iter()
+        .map(|path| {
+            let contents = std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+            Patch { path, contents }
+        })
+        .collect();
+    export_patches_digest(&patches);
     if patches.is_empty() {
         return pristine.to_path_buf();
     }
-    patches.sort();
 
     let mut stamp = String::new();
     let mut patched_paths = std::collections::BTreeSet::new();
     for patch in &patches {
-        let contents = std::fs::read_to_string(patch)
-            .unwrap_or_else(|err| panic!("failed to read {}: {err}", patch.display()));
-        let paths = patch_paths(&contents);
-        // Bindgen and the wrapper shims compile against the pristine headers, so a header
+        let paths = patch_paths(&patch.contents);
+        // The binding generator and wrapper shims use the pristine headers, so a header
         // change would reach only half the build and split the ABI.
         if let Some(header) = paths.iter().find(|path| is_header(path)) {
             panic!(
                 "{} touches the header {header}; llama.cpp patches may change sources only",
-                patch.display()
+                patch.path.display()
             );
         }
         patched_paths.extend(paths);
-        stamp.push_str(&format!("patch {}\n{contents}\n", patch.display()));
+        stamp.push_str(&format!(
+            "patch {}\n{}\n",
+            patch.path.display(),
+            patch.contents
+        ));
     }
     let source_files: Vec<walkdir::DirEntry> = walkdir::WalkDir::new(pristine)
         .sort_by_file_name()
@@ -541,10 +576,7 @@ fn prepare_llama_src(pristine: &Path, patches_dir: &Path, out_dir: &Path) -> Pat
     // from reporting that repository's commit.
     run_git(&dest, &["init", "--quiet"]);
     for patch in &patches {
-        run_git(
-            &dest,
-            &["apply", "--whitespace=nowarn", &patch.display().to_string()],
-        );
+        apply_patch(&dest, patch);
     }
 
     let patched_path_list: String = patched_paths
@@ -587,10 +619,10 @@ fn is_header(path: &str) -> bool {
         .is_some_and(|extension| HEADER_EXTENSIONS.contains(&extension))
 }
 
-/// Guards against ggml drift between the linked libggml and the headers bindgen reads.
+/// Guards against ggml drift between the linked libggml and the binding/shim headers.
 ///
-/// The linker resolves ggml symbols from `ggml-sys`, but bindgen processes `wrapper.h`, which
-/// includes this submodule's `ggml/include/`. When `ggml-sys` builds ggml from llama.cpp's own
+/// The linker resolves ggml symbols from `ggml-sys`, while `generate-bindings` and the C++ shims
+/// read this submodule's `ggml/include/`. When `ggml-sys` builds ggml from llama.cpp's own
 /// tree it exports that commit as `DEP_GGML_LLAMA_CPP_REV`, and the two must be the same commit,
 /// or the generated Rust types can silently disagree with the linked binary's layout.
 /// `scripts/sync-ggml.last` cannot establish that: it only moves when llama.cpp syncs with
@@ -601,7 +633,7 @@ fn verify_system_ggml_revision(llama_src: &Path) {
             Some(actual_rev) if actual_rev == expected_rev => {}
             Some(actual_rev) => panic!(
                 "ggml drift: ggml-sys builds ggml from llama.cpp {expected_rev}, but this fork's \
-                 llama.cpp submodule is at {actual_rev}. bindgen reads the submodule's ggml \
+                 llama.cpp submodule is at {actual_rev}. The bindings and shims use its ggml \
                  headers while linking ggml-sys's library, so both must be the same commit: move \
                  ggml-sys's llama.cpp pin and this submodule together."
             ),
@@ -632,7 +664,7 @@ fn verify_system_ggml_revision(llama_src: &Path) {
         println!(
             "cargo:warning=ggml SHA drift: ggml-sys is pinned at {expected_sync} but this fork's \
              bundled llama.cpp/ggml synced from {bundled_sync}. The linked libggml comes from \
-             ggml-sys's SHA, while bindgen reads bundled headers. This is safe only if ggml's C \
+             ggml-sys's SHA, while bindings and shims use bundled headers. This is safe only if ggml's C \
              API is binary-compatible across the drift range."
         );
     }
@@ -656,6 +688,39 @@ fn llama_cpp_submodule_rev(llama_src: &Path) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+/// Applies `patch` to the tree at `dir`, from the bytes read at the start of the build.
+fn apply_patch(dir: &Path, patch: &Patch) {
+    use std::io::Write as _;
+
+    let mut child = Command::new("git")
+        .args(["apply", "--whitespace=nowarn", "-"])
+        .current_dir(dir)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|err| panic!("failed to run git apply: {err}"));
+    child
+        .stdin
+        .take()
+        .expect("git apply's stdin is piped")
+        .write_all(patch.contents.as_bytes())
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to pass {} to git apply: {err}",
+                patch.path.display()
+            )
+        });
+    let status = child
+        .wait()
+        .unwrap_or_else(|err| panic!("failed to wait for git apply: {err}"));
+    if !status.success() {
+        panic!(
+            "{} no longer applies to the pinned llama.cpp; refresh it against the new pin, or \
+             delete it if upstream fixed the issue",
+            patch.path.display()
+        );
+    }
+}
+
 fn run_git(dir: &Path, args: &[&str]) {
     let status = Command::new("git")
         .args(args)
@@ -663,11 +728,7 @@ fn run_git(dir: &Path, args: &[&str]) {
         .status()
         .unwrap_or_else(|err| panic!("failed to run git {args:?}: {err}"));
     if !status.success() {
-        panic!(
-            "git {args:?} failed in {}: a patch in patches/ no longer applies to the pinned \
-             llama.cpp; refresh it against the new pin, or delete it if upstream fixed the issue",
-            dir.display()
-        );
+        panic!("git {args:?} failed in {}", dir.display());
     }
 }
 
@@ -705,13 +766,14 @@ fn cpu_selection_flag(target_arch: &str, target_env: &str, cpu: &str) -> Option<
     }
     match target_arch {
         "x86" | "x86_64" => Some(format!("-march={cpu}")),
-        "aarch64" | "arm" => Some(format!("-mcpu={cpu}")),
+        "aarch64" | "arm" | "powerpc" | "powerpc64" => Some(format!("-mcpu={cpu}")),
         _ => None,
     }
 }
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=build_support.rs");
 
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();
 
@@ -719,7 +781,8 @@ fn main() {
         parse_target_os().unwrap_or_else(|t| panic!("Failed to parse target os {t}"));
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
-    let target_dir = get_cargo_target_dir().unwrap();
+    let target_dir = build_support::cargo_profile_dir(&out_dir)
+        .expect("OUT_DIR must be inside Cargo's build directory");
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("Failed to get CARGO_MANIFEST_DIR");
     let llama_src = Path::new(&manifest_dir).join("llama.cpp");
     let build_shared_libs = cfg!(feature = "dynamic-link");
@@ -777,7 +840,7 @@ fn main() {
         }
     }
 
-    // Only CMake compiles the patched tree. Bindgen and the wrapper shims read the pristine
+    // Only CMake compiles the patched tree. The binding generator and shims read the pristine
     // headers, which patches may not change.
     let llama_build_src = prepare_llama_src(
         &llama_src,
@@ -862,6 +925,9 @@ fn main() {
     // Build with Cmake
 
     let mut config = Config::new(&llama_build_src);
+    // Direct cache hits can reuse another checkout's incompatible ggml layouts.
+    // https://github.com/mozilla/sccache/issues/2863
+    config.env("SCCACHE_DIRECT", "false");
 
     // Would require extra source files to pointlessly
     // be included in what's uploaded to and downloaded from

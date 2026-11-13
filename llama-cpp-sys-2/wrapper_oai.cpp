@@ -15,6 +15,15 @@
 
 using json = nlohmann::ordered_json;
 
+// Immutable native grammar shared by a template result and its response parsers.
+struct llama_rs_chat_syntax {
+    common_peg_arena arena;
+};
+
+extern "C" void llama_rs_chat_syntax_free(struct llama_rs_chat_syntax * syntax) {
+    delete syntax;
+}
+
 static void init_chat_msg(struct llama_rs_chat_msg_oaicompat * out_msg) {
     if (!out_msg) {
         return;
@@ -201,12 +210,12 @@ extern "C" llama_rs_status llama_rs_apply_chat_template_with_tools_oaicompat(
         }
 
         auto params = common_chat_templates_apply(tmpls.get(), inputs);
-        out_result->prompt = llama_rs_dup_string(params.prompt);
+        out_result->prompt = llama_rs_dup_string(params.prompt.str());
         if (!params.grammar.empty()) {
             out_result->grammar = llama_rs_dup_string(params.grammar);
         }
         if (!params.parser.empty()) {
-            out_result->parser = llama_rs_dup_string(params.parser);
+            out_result->parser = new llama_rs_chat_syntax{std::move(params.parser)};
         }
         if (!params.generation_prompt.empty()) {
             out_result->generation_prompt = llama_rs_dup_string(params.generation_prompt);
@@ -331,12 +340,12 @@ extern "C" llama_rs_status llama_rs_apply_chat_template_oaicompat(
         }
 
         auto params_out = common_chat_templates_apply(tmpls.get(), inputs);
-        out_result->prompt = llama_rs_dup_string(params_out.prompt);
+        out_result->prompt = llama_rs_dup_string(params_out.prompt.str());
         if (!params_out.grammar.empty()) {
             out_result->grammar = llama_rs_dup_string(params_out.grammar);
         }
         if (!params_out.parser.empty()) {
-            out_result->parser = llama_rs_dup_string(params_out.parser);
+            out_result->parser = new llama_rs_chat_syntax{std::move(params_out.parser)};
         }
         if (!params_out.generation_prompt.empty()) {
             out_result->generation_prompt = llama_rs_dup_string(params_out.generation_prompt);
@@ -396,21 +405,21 @@ extern "C" llama_rs_status llama_rs_apply_chat_template_oaicompat(
 }
 
 // Builds the parse settings of a chat template result.
-// Loading `parser_data` deserializes the template's whole PEG parser, so a caller parsing many
-// responses keeps the result.
+// The native syntax owns the template's PEG arena, and each response parser keeps a copy.
 static common_chat_parser_params make_chat_parser_params(
     int chat_format,
     bool parse_tool_calls,
-    const char * parser_data,
+    const struct llama_rs_chat_syntax * parser_data,
     const char * generation_prompt) {
     common_chat_parser_params syntax;
     syntax.format = static_cast<common_chat_format>(chat_format);
-    syntax.parse_tool_calls = parse_tool_calls;
+    // The generated native grammar already encodes whether tool calls are permitted.
+    (void) parse_tool_calls;
     if (generation_prompt && std::strlen(generation_prompt) > 0) {
-        syntax.generation_prompt = generation_prompt;
+        syntax.generation_prompt = common_chat_input(generation_prompt);
     }
-    if (parser_data && std::strlen(parser_data) > 0) {
-        syntax.parser.load(parser_data);
+    if (parser_data) {
+        syntax.parser = parser_data->arena;
     }
     return syntax;
 }
@@ -420,7 +429,7 @@ extern "C" llama_rs_status llama_rs_chat_parse_to_oaicompat(
     bool is_partial,
     int chat_format,
     bool parse_tool_calls,
-    const char * parser_data,
+    const struct llama_rs_chat_syntax * parser_data,
     const char * generation_prompt,
     struct llama_rs_chat_msg_oaicompat * out_msg) {
     if (!input || !out_msg) {
@@ -435,7 +444,7 @@ extern "C" llama_rs_status llama_rs_chat_parse_to_oaicompat(
         // Tool-call ids are intentionally left as parsed (usually empty): id
         // assignment is caller policy, and generating ids here would require
         // duplicating the id helpers llama.cpp keeps in its server tool.
-        const auto msg = common_chat_parse(input, is_partial, syntax);
+        const auto msg = common_chat_parse(common_chat_input(input), is_partial, syntax);
         const auto status = fill_chat_msg(msg, out_msg);
         if (status != LLAMA_RS_STATUS_OK) {
             llama_rs_chat_msg_free_oaicompat(out_msg);
@@ -508,7 +517,7 @@ struct llama_rs_chat_parser {
 extern "C" llama_rs_status llama_rs_chat_parser_init(
     int chat_format,
     bool parse_tool_calls,
-    const char * parser_data,
+    const struct llama_rs_chat_syntax * parser_data,
     const char * generation_prompt,
     struct llama_rs_chat_parser ** out_parser) {
     if (!out_parser) {
@@ -544,7 +553,7 @@ extern "C" llama_rs_status llama_rs_chat_parser_parse(
     init_chat_msg(out_msg);
 
     try {
-        const auto msg = common_chat_parse(input, is_partial, parser->params);
+        const auto msg = common_chat_parse(common_chat_input(input), is_partial, parser->params);
         const auto status = fill_chat_msg(msg, out_msg);
         if (status != LLAMA_RS_STATUS_OK) {
             llama_rs_chat_msg_free_oaicompat(out_msg);
@@ -621,7 +630,7 @@ extern "C" llama_rs_status llama_rs_chat_parser_update(
         // Like llama-server, parse the whole response again: the PEG parser cannot resume from an
         // earlier parse, so only the loaded parser is reused.
         parser->generated_text += text_added;
-        auto new_msg = common_chat_parse(parser->generated_text, is_partial, parser->params);
+        auto new_msg = common_chat_parse(common_chat_input(parser->generated_text), is_partial, parser->params);
         if (new_msg.empty()) {
             return LLAMA_RS_STATUS_OK;
         }

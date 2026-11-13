@@ -22,42 +22,42 @@ before the patch and a get_weather tool call after it. The airtype-desktop-infer
 tools_plus_structured_output_can_call_a_tool_qwen35_4b and
 tools_plus_structured_output_can_still_return_schema_json_qwen35_4b pass with it on Qwen3.5 4B.
 
+Refreshed for b12332; upstream now keeps response-format grammars eager without patch 0001.
+
 diff --git a/common/parsers/qwen3-coder.cpp b/common/parsers/qwen3-coder.cpp
-index 62b29b4..daa56a6 100644
 --- a/common/parsers/qwen3-coder.cpp
 +++ b/common/parsers/qwen3-coder.cpp
-@@ -81,13 +81,15 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
-                                    (p.literal("</think>") | p.peek(p.literal("<tool_call>"))));
+@@ -86,8 +86,10 @@
+             reasoning = reasoning_extracted;
          }
- 
-+        auto uses_tools = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
+
++        const bool uses_tools = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
 +
          // Response format parser
 -        if (has_response_format) {
 +        if (has_response_format && !uses_tools) {
-             return generation_prompt + (reasoning << p.content(p.schema(p.json(), "response-format", inputs.json_schema)));
+             // The answer must be bare JSON, so the think block is consumed even when it is not extracted
+             if (supports_reasoning && !extract_reasoning) {
+                 reasoning = reasoning_skipped;
+@@ -96,7 +98,7 @@
          }
- 
+
          // Tool call parser
 -        if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
 +        if (uses_tools) {
              auto arg_close  = p.tool_arg_close(p.literal("\n</parameter>\n"));
              auto arg_string = p.rule("xml-arg-string",
                  p.ac(p.tool_arg_string_value(p.until("\n</parameter>\n")) + arg_close, "\n</parameter>\n"));
-@@ -164,6 +166,16 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
+@@ -173,6 +175,12 @@
                  tool_call;
- 
+
              auto calls      = inputs.parallel_tool_calls ? tool_call_first + p.zero_or_more(tool_call) : tool_call_first;
-+
-+            // With a response format, a reply either calls tools or answers in that format.
-+            // Free text before a tool call would escape the schema, so only reasoning may precede
-+            // either branch.
++            // A constrained reply either calls a tool or answers in the requested schema.
 +            if (has_response_format) {
-+                auto tool_calls      = p.trigger_rule("tool-call-root", calls);
-+                auto response_format = p.content(p.schema(p.json(), "response-format", inputs.json_schema));
-+                return generation_prompt + (reasoning << p.choice({ tool_calls, response_format }));
++                auto tool_calls = p.trigger_rule("tool-call-root", calls);
++                auto response = p.content(p.schema(p.json(), "response-format", inputs.json_schema));
++                return generation_prompt + (reasoning << p.choice({tool_calls, response}));
 +            }
-+
              auto tool_calls = p.trigger_rule("tool-call-root", p.repeat(calls, min_calls, 1));
- 
-             return generation_prompt +
+
+             // The templates separate content from the tool calls with one or two newlines,

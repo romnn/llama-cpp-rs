@@ -1,0 +1,41 @@
+From: Airtype downstream
+Subject: [PATCH] mtmd: attribute host weights to the registered CPU device
+
+ggml-base's CPU buffer type has a null device pointer. mtmd's weight counter uses that
+pointer as its key, so CPU projector estimates include a null device even though their
+compute buffers belong to the registered CPU device. The binding rejects the unregistered
+entry and the desktop falls back to charging only the projector file, omitting its compute.
+
+Resolve device-less host buffers to the registered CPU device when accounting for weights.
+Other unknown devices remain errors, and device-owned buffers retain their original owner.
+
+Observed with llama.cpp b12332 and LFM3-VL-2B's F16 projector on CPU and CUDA 13.3.
+Regression coverage: the_projector_is_charged_to_the_device_it_runs_on checks CPU compute
+is included and GPU weights stay on the GPU.
+
+Upstream report: not yet filed.
+
+diff --git a/tools/mtmd/mtmd-model.cpp b/tools/mtmd/mtmd-model.cpp
+--- a/tools/mtmd/mtmd-model.cpp
++++ b/tools/mtmd/mtmd-model.cpp
+@@ -1315,6 +1315,11 @@
+     }
+
+     void load_tensors(mtmd_model & model, ggml_backend_buffer_type_t buft, bool no_alloc) {
++        ggml_backend_dev_t weights_device = ggml_backend_buft_get_device(buft);
++        // Host buffers in ggml-base have no owning device; charge their weights to the CPU.
++        if (!weights_device && ggml_backend_buft_is_host(buft)) {
++            weights_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++        }
+         auto & hparams = model.hparams;
+         std::map<std::string, size_t> tensor_offset;
+         std::vector<ggml_tensor *> tensors_to_load;
+@@ -1364,7 +1369,7 @@
+                 loaded_tensor_names.insert(name);
+                 cur = data_tensor;
+                 // add to weight memory counter
+-                model.mem_weights[ggml_backend_buft_get_device(buft)] += ggml_nbytes(cur);
++                model.mem_weights[weights_device] += ggml_nbytes(cur);
+             }
+             return cur;
+         };

@@ -55,8 +55,7 @@ extern "C" llama_rs_status llama_rs_chat_template_get_caps(
         const auto caps = common_chat_templates_get_caps(tmpls.get());
 
         const auto read_cap = [&](const char * key) {
-            const auto it = caps.find(key);
-            return it != caps.end() ? it->second : false;
+            return caps.contains(key) && caps.at(key).get<bool>();
         };
 
         out_caps->supports_tools = read_cap("supports_tools");
@@ -105,7 +104,7 @@ extern "C" void llama_rs_chat_template_result_free(struct llama_rs_chat_template
         std::free(result->grammar);
     }
     if (result->parser) {
-        std::free(result->parser);
+        llama_rs_chat_syntax_free(result->parser);
     }
     if (result->generation_prompt) {
         std::free(result->generation_prompt);
@@ -305,7 +304,7 @@ extern "C" int llama_rs_fit_params(
     const void * extra,
     enum ggml_log_level log_level) {
     return static_cast<int>(common_fit_params(
-        path_model,
+        std::vector<std::string>{path_model},
         mparams,
         cparams,
         tensor_split,

@@ -34,9 +34,9 @@ mod log;
 pub mod model;
 #[cfg(feature = "mtmd")]
 pub mod mtmd;
-mod ptr;
 #[cfg(feature = "common")]
 pub mod openai;
+mod ptr;
 pub mod sampling;
 #[cfg(feature = "common")]
 pub mod speculative;

@@ -103,26 +103,10 @@ impl<'model> LlamaContext<'model> {
         }
     }
 
-    /// Waits for all pending backend work on this context to finish.
-    ///
-    /// Decoding can return before asynchronous backends finish, including when no logits are
-    /// requested or read.
-    pub fn synchronize(&mut self) {
-        // SAFETY: The context owns this live pointer and the mutable borrow excludes other access.
-        unsafe { llama_cpp_sys_2::llama_synchronize(self.context.as_ptr()) }
-    }
-
     /// Returns the model allocation that remains valid for this context's lifetime.
     #[must_use]
     pub fn model(&self) -> &LlamaModel {
         self.model.as_model()
-    }
-
-    }
-
-    // FIXME(madsmtm): Somehow return `LlamaModel<'_>` here?
-    fn model_ptr(&self) -> *const llama_cpp_sys_2::llama_model {
-        unsafe { llama_cpp_sys_2::llama_get_model(self.context.as_ptr()) }
     }
 
     /// Gets the max number of logical tokens that can be submitted to decode. Must be greater than or equal to [`Self::n_ubatch`].
@@ -287,13 +271,11 @@ impl<'model> LlamaContext<'model> {
     fn embeddings_out_len(&self) -> usize {
         let pooling = unsafe { llama_cpp_sys_2::llama_pooling_type(self.context.as_ptr()) };
 
-        let model = self.model_ptr();
         if pooling == llama_cpp_sys_2::LLAMA_POOLING_TYPE_RANK {
-            let n_cls_out = unsafe { llama_cpp_sys_2::llama_model_n_cls_out(model) };
-            usize::try_from(n_cls_out).expect("n_cls_out does not fit into a usize")
+            usize::try_from(self.model().n_cls_out()).expect("n_cls_out does not fit into a usize")
         } else {
-            let n_embd_out = unsafe { llama_cpp_sys_2::llama_model_n_embd_out(model) };
-            usize::try_from(n_embd_out).expect("n_embd_out does not fit into a usize")
+            usize::try_from(self.model().n_embd_out())
+                .expect("n_embd_out does not fit into a usize")
         }
     }
 
@@ -347,11 +329,8 @@ impl<'model> LlamaContext<'model> {
     pub fn get_logits(&self) -> &[f32] {
         let data = unsafe { llama_cpp_sys_2::llama_get_logits(self.synchronizable_ptr()) };
         assert!(!data.is_null(), "logits data for last token is null");
-
-        let model = self.model_ptr();
-        let vocab = unsafe { llama_cpp_sys_2::llama_model_get_vocab(model) };
-        let n_vocab = unsafe { llama_cpp_sys_2::llama_vocab_n_tokens(vocab) };
-        let len = usize::try_from(n_vocab).expect("n_vocab does not fit into a usize");
+        let len =
+            usize::try_from(self.model().n_vocab()).expect("n_vocab does not fit into a usize");
 
         unsafe { slice::from_raw_parts(data, len) }
     }
@@ -397,11 +376,8 @@ impl<'model> LlamaContext<'model> {
         if data.is_null() {
             panic!("invalid logit index {i}");
         }
-
-        let model = self.model_ptr();
-        let vocab = unsafe { llama_cpp_sys_2::llama_model_get_vocab(model) };
-        let n_vocab = unsafe { llama_cpp_sys_2::llama_vocab_n_tokens(vocab) };
-        let len = usize::try_from(n_vocab).expect("n_vocab does not fit into a usize");
+        let len =
+            usize::try_from(self.model().n_vocab()).expect("n_vocab does not fit into a usize");
 
         unsafe { slice::from_raw_parts(data, len) }
     }

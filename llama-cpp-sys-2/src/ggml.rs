@@ -1649,16 +1649,6 @@ extern "C" {
     ) -> *mut ggml_tensor;
 }
 extern "C" {
-    pub fn ggml_rope_yarn_corr_dims(
-        n_dims: ::std::os::raw::c_int,
-        n_ctx_orig: ::std::os::raw::c_int,
-        freq_base: f32,
-        beta_fast: f32,
-        beta_slow: f32,
-        dims: *mut f32,
-    );
-}
-extern "C" {
     pub fn ggml_rope_ext_back(
         ctx: *mut ggml_context,
         a: *mut ggml_tensor,
@@ -1698,6 +1688,9 @@ extern "C" {
         a: *mut ggml_tensor,
         n_offs: ::std::os::raw::c_int,
     ) -> *mut ggml_tensor;
+}
+extern "C" {
+    pub fn ggml_rope_set_truncate(a: *mut ggml_tensor, truncate: bool) -> *mut ggml_tensor;
 }
 extern "C" {
     pub fn ggml_im2col(

@@ -6,6 +6,7 @@ use std::fmt;
 use std::mem;
 use std::ptr::{self, NonNull};
 use std::slice;
+use std::sync::Arc;
 
 /// Parameters for applying OpenAI-compatible chat templates.
 #[derive(Debug, Clone, PartialEq)]
@@ -210,10 +211,52 @@ impl ChatMessageDiffOaicompat {
     }
 }
 
+/// Immutable native response syntax produced by a chat template.
+///
+/// Clones share the syntax allocation; response parsers keep independent streaming state.
+#[derive(Clone, Debug)]
+pub struct ChatParserSyntax(Arc<NativeChatSyntax>);
+
+#[derive(Debug)]
+struct NativeChatSyntax {
+    pointer: NonNull<llama_cpp_sys_2::llama_rs_chat_syntax>,
+}
+
+// SAFETY: The arena is immutable after template rendering and has no thread affinity.
+// Every response parser copies it before parsing, so no shared native state is mutated.
+unsafe impl Send for NativeChatSyntax {}
+// SAFETY: Shared access only reads the immutable arena while its Arc keeps it alive.
+unsafe impl Sync for NativeChatSyntax {}
+
+impl ChatParserSyntax {
+    /// Takes the syntax allocation out of a native template result.
+    ///
+    /// # Safety
+    ///
+    /// A non-null pointer must be owned and created by this binding's template renderer.
+    pub(crate) unsafe fn take(
+        raw: &mut *mut llama_cpp_sys_2::llama_rs_chat_syntax,
+    ) -> Option<Self> {
+        NonNull::new(std::mem::replace(raw, ptr::null_mut()))
+            .map(|pointer| Self(Arc::new(NativeChatSyntax { pointer })))
+    }
+
+    fn as_ptr(&self) -> *const llama_cpp_sys_2::llama_rs_chat_syntax {
+        let Self(syntax) = self;
+        syntax.pointer.as_ptr()
+    }
+}
+
+impl Drop for NativeChatSyntax {
+    fn drop(&mut self) {
+        // SAFETY: This allocation came from template rendering and the final Arc owns it alone.
+        unsafe { llama_cpp_sys_2::llama_rs_chat_syntax_free(self.pointer.as_ptr()) }
+    }
+}
+
 /// Parses the responses generated for one [`ChatTemplateResult`].
 ///
-/// Creating the parser deserializes the template's PEG parser once, so later parses skip that
-/// cost.
+/// Each response parser owns a copy of the native syntax for its generated response.
 /// The parser also follows one streamed response: [`Self::update`] appends generated text and
 /// reports what changed, as llama-server does for each generated token.
 pub struct ChatResponseParser {
@@ -235,10 +278,9 @@ impl ChatTemplateResult {
     ///
     /// # Errors
     ///
-    /// Returns [`ChatParseError`] when the serialized parser or the generation prompt contains a
-    /// null byte, or when the native parser cannot be loaded.
+    /// Returns [`ChatParseError`] when the generation prompt contains a null byte or the native
+    /// parser cannot be created.
     pub fn response_parser(&self) -> Result<ChatResponseParser, ChatParseError> {
-        let parser_cstr = self.parser.as_deref().map(CString::new).transpose()?;
         let generation_prompt_cstr = if self.generation_prompt.is_empty() {
             None
         } else {
@@ -251,9 +293,9 @@ impl ChatTemplateResult {
             llama_cpp_sys_2::llama_rs_chat_parser_init(
                 self.chat_format,
                 self.parse_tool_calls,
-                parser_cstr
+                self.parser
                     .as_ref()
-                    .map_or(ptr::null(), |cstr| cstr.as_ptr()),
+                    .map_or(ptr::null(), ChatParserSyntax::as_ptr),
                 generation_prompt_cstr
                     .as_ref()
                     .map_or(ptr::null(), |cstr| cstr.as_ptr()),

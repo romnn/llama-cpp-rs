@@ -1,6 +1,5 @@
 //! A safe wrapper around `llama_model`.
 use std::ffi::{c_char, CStr, CString};
-use std::mem;
 use std::os::raw::c_int;
 use std::path::Path;
 use std::ptr;
@@ -13,7 +12,7 @@ use crate::context::params::LlamaContextParams;
 use crate::context::LlamaContext;
 use crate::llama_backend::LlamaBackend;
 use crate::model::params::LlamaModelParams;
-use crate::openai::{ChatMessageOaicompat, OpenAIChatTemplateParams};
+use crate::openai::{ChatMessageOaicompat, ChatParserSyntax, OpenAIChatTemplateParams};
 use crate::ptr::Ptr;
 use crate::sampling::LlamaSampler;
 use crate::token::LlamaToken;
@@ -136,7 +135,7 @@ pub struct GrammarTrigger {
 }
 
 /// Result of applying a chat template with tool grammar support.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ChatTemplateResult {
     /// Rendered chat prompt.
     pub prompt: String,
@@ -152,8 +151,8 @@ pub struct ChatTemplateResult {
     pub additional_stops: Vec<String>,
     /// Chat format used for parsing responses.
     pub chat_format: i32,
-    /// Optional serialized PEG parser for tool-call parsing.
-    pub parser: Option<String>,
+    /// Native response syntax, shared by clones of this template result.
+    pub parser: Option<ChatParserSyntax>,
     /// Prefix that must be prepended for parser-compatible response reconstruction.
     pub generation_prompt: String,
     /// Marker that opens a reasoning block when the template supports thinking.
@@ -170,18 +169,18 @@ pub struct ChatTemplateResult {
     pub parse_tool_calls: bool,
 }
 
-/// The RoPE type that's used within the model.
+/// The Rope type that's used within the model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RopeType {
-    /// Normal RoPE.
+    /// Standard rotary positional embeddings.
     Norm,
-    /// Neox-style dimension interleave.
+    /// GPT-NeoX rotary positional embeddings.
     NeoX,
-    /// multi-section rotary embedding (MRoPE).
+    /// Multi-dimensional rotary positional embeddings.
     MRope,
-    /// Interleaved MRoPE.
+    /// Interleaved multi-dimensional rotary positional embeddings.
     IMRope,
-    /// Vision RoPE.
+    /// Rotary positional embeddings used by vision models.
     Vision,
 }
 
@@ -487,10 +486,7 @@ impl LlamaModel {
         };
         let context = Ptr::new(context).ok_or(LlamaContextLoadError::NullReturn)?;
 
-        Ok(LlamaContext::new_borrowed(
-            self,
-            context,
-        ))
+        Ok(LlamaContext::new_borrowed(self, context))
     }
 
     /// Creates a context that keeps this model allocation alive through shared ownership.
@@ -510,7 +506,10 @@ impl LlamaModel {
         // SAFETY: The model pointer remains alive because ownership of `self` moves into the
         // returned context after this call succeeds.
         let context = unsafe {
-            llama_cpp_sys_2::llama_new_context_with_model(self.model.as_mut_ptr_unsound(), context_params)
+            llama_cpp_sys_2::llama_new_context_with_model(
+                self.model.as_mut_ptr_unsound(),
+                context_params,
+            )
         };
         let context = Ptr::new(context).ok_or(LlamaContextLoadError::NullReturn)?;
 
@@ -546,10 +545,7 @@ impl LlamaModel {
         };
         let context = Ptr::new(context).ok_or(LlamaContextLoadError::NullReturn)?;
 
-        Ok(LlamaContext::new_borrowed(
-            self,
-            context,
-        ))
+        Ok(LlamaContext::new_borrowed(self, context))
     }
 
     /// Creates a new context with backend samplers attached for specific sequences.
@@ -612,7 +608,7 @@ impl LlamaModel {
         };
         let context = Ptr::new(context).ok_or(LlamaContextLoadError::NullReturn)?;
 
-        Ok(LlamaContext::with_samplers(context, samplers))
+        Ok(LlamaContext::with_samplers(self, context, samplers))
     }
 
     /// Apply the models chat template to some messages.
@@ -786,14 +782,9 @@ impl LlamaModel {
                     .to_vec();
                 Some(String::from_utf8(grammar_bytes)?)
             };
-            let parser = if raw_result.parser.is_null() {
-                None
-            } else {
-                let parser_bytes = unsafe { CStr::from_ptr(raw_result.parser) }
-                    .to_bytes()
-                    .to_vec();
-                Some(String::from_utf8(parser_bytes)?)
-            };
+            // SAFETY: The result owns this native syntax; taking it clears the pointer so the
+            // result cleanup cannot free the allocation the Rust handle now owns.
+            let parser = unsafe { ChatParserSyntax::take(&mut raw_result.parser) };
             let generation_prompt = if raw_result.generation_prompt.is_null() {
                 String::new()
             } else {
@@ -969,14 +960,9 @@ impl LlamaModel {
                     .to_vec();
                 Some(String::from_utf8(grammar_bytes)?)
             };
-            let parser = if raw_result.parser.is_null() {
-                None
-            } else {
-                let parser_bytes = unsafe { CStr::from_ptr(raw_result.parser) }
-                    .to_bytes()
-                    .to_vec();
-                Some(String::from_utf8(parser_bytes)?)
-            };
+            // SAFETY: The result owns this native syntax; taking it clears the pointer so the
+            // result cleanup cannot free the allocation the Rust handle now owns.
+            let parser = unsafe { ChatParserSyntax::take(&mut raw_result.parser) };
             let generation_prompt = if raw_result.generation_prompt.is_null() {
                 String::new()
             } else {
@@ -1114,38 +1100,7 @@ impl ChatTemplateResult {
         text: &str,
         is_partial: bool,
     ) -> Result<ChatMessageOaicompat, ChatParseError> {
-        let text_cstr = CString::new(text)?;
-        let parser_cstr = self.parser.as_deref().map(CString::new).transpose()?;
-        let generation_prompt_cstr = if self.generation_prompt.is_empty() {
-            None
-        } else {
-            Some(CString::new(self.generation_prompt.as_str())?)
-        };
-        let mut out_msg: llama_cpp_sys_2::llama_rs_chat_msg_oaicompat = unsafe { mem::zeroed() };
-        let rc = unsafe {
-            llama_cpp_sys_2::llama_rs_chat_parse_to_oaicompat(
-                text_cstr.as_ptr(),
-                is_partial,
-                self.chat_format,
-                self.parse_tool_calls,
-                parser_cstr
-                    .as_ref()
-                    .map_or(ptr::null(), |cstr| cstr.as_ptr()),
-                generation_prompt_cstr
-                    .as_ref()
-                    .map_or(ptr::null(), |cstr| cstr.as_ptr()),
-                &mut out_msg,
-            )
-        };
-
-        if !status_is_ok(rc) {
-            return Err(ChatParseError::FfiError(rc));
-        }
-        // SAFETY: On success the wrapper filled `out_msg` with owned
-        // allocations that stay valid until the free call below.
-        let result = unsafe { ChatMessageOaicompat::from_ffi(&out_msg) };
-        unsafe { llama_cpp_sys_2::llama_rs_chat_msg_free_oaicompat(&mut out_msg) };
-        result
+        self.response_parser()?.parse(text, is_partial)
     }
 }
 

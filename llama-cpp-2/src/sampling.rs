@@ -120,7 +120,8 @@ impl LlamaSampler {
     ) -> Option<LlamaToken> {
         // SAFETY: A live `LlamaContext` owns a valid context pointer, and llama.cpp returns null
         // for an output it does not hold.
-        let logits = unsafe { llama_cpp_sys_2::llama_get_logits_ith(ctx.context.as_ptr(), idx) };
+        let logits =
+            unsafe { llama_cpp_sys_2::llama_get_logits_ith(ctx.synchronizable_ptr(), idx) };
         if logits.is_null() {
             return None;
         }
@@ -586,11 +587,8 @@ impl LlamaSampler {
                 budget,
             )
         };
-        if sampler.is_null() {
-            Err(ReasoningBudgetError::NullSampler)
-        } else {
-            Ok(Self { sampler })
-        }
+        let sampler = Ptr::new(sampler).ok_or(ReasoningBudgetError::NullSampler)?;
+        Ok(Self { sampler })
     }
 
     /// Builds the `toktrie` tokenizer environment for `model`.
@@ -842,7 +840,7 @@ fn validate_reasoning_budget_inputs(
 }
 
 #[cfg(all(test, feature = "common"))]
-mod tests {
+mod reasoning_budget_tests {
     use super::validate_reasoning_budget_inputs;
     use crate::token::LlamaToken;
     use crate::ReasoningBudgetError;

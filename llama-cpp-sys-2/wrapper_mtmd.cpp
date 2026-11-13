@@ -50,7 +50,7 @@ extern "C" llama_rs_mtmd_status llama_rs_mtmd_estimate_memory_usage(
     *out_device_count = 0;
 
     try {
-        const std::map<ggml_backend_dev_t, size_t> usage = mtmd_get_memory_usage(mmproj_path, *params);
+        const std::map<ggml_backend_dev_t, size_t> usage = mtmd_get_memory_usage(mmproj_path, *params).backend_mem_usage;
         // Upstream reports a failed projection as an empty map; a successful one always charges
         // the weights to at least one device.
         if (usage.empty()) {
