@@ -82,6 +82,28 @@ impl LlamaChatTemplate {
     pub fn to_string(&self) -> Result<String, Utf8Error> {
         self.to_str().map(str::to_string)
     }
+
+    /// Renders this template with OpenAI-compatible JSON messages without loading a model.
+    ///
+    /// The result carries the same prompt, grammar, and response parser as
+    /// [`LlamaModel::apply_chat_template_oaicompat`], except that the template sees no BOS or EOS
+    /// token.
+    /// Tests and tools use it to build a [`ChatTemplateResult`] for a known template.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplyChatTemplateError::MissingTemplate`] for an empty template, which only a
+    /// model can supply, and otherwise fails as
+    /// [`LlamaModel::apply_chat_template_oaicompat`] does.
+    pub fn apply_oaicompat(
+        &self,
+        params: &OpenAIChatTemplateParams<'_>,
+    ) -> Result<ChatTemplateResult, ApplyChatTemplateError> {
+        if self.0.is_empty() {
+            return Err(ApplyChatTemplateError::MissingTemplate);
+        }
+        render_oaicompat(ptr::null(), self, params)
+    }
 }
 
 impl std::fmt::Debug for LlamaChatTemplate {
@@ -875,176 +897,187 @@ impl LlamaModel {
         tmpl: &LlamaChatTemplate,
         params: &OpenAIChatTemplateParams<'_>,
     ) -> Result<ChatTemplateResult, ApplyChatTemplateError> {
-        let parse_tool_calls = params.parse_tool_calls;
-        let messages_cstr = CString::new(params.messages_json)?;
-        let tools_cstr = params.tools_json.map(CString::new).transpose()?;
-        let tool_choice_cstr = params.tool_choice.map(CString::new).transpose()?;
-        let json_schema_cstr = params.json_schema.map(CString::new).transpose()?;
-        let grammar_cstr = params.grammar.map(CString::new).transpose()?;
-        let reasoning_cstr = params.reasoning_format.map(CString::new).transpose()?;
-        let kwargs_cstr = params.chat_template_kwargs.map(CString::new).transpose()?;
+        render_oaicompat(self.model.as_ptr(), tmpl, params)
+    }
+}
 
-        let mut raw_result = llama_cpp_sys_2::llama_rs_chat_template_result {
-            prompt: ptr::null_mut(),
-            grammar: ptr::null_mut(),
-            parser: ptr::null_mut(),
-            generation_prompt: ptr::null_mut(),
-            thinking_start_tag: ptr::null_mut(),
-            thinking_end_tags: ptr::null_mut(),
-            thinking_end_tags_count: 0,
-            supports_thinking: false,
-            chat_format: 0,
-            grammar_lazy: false,
-            grammar_triggers: ptr::null_mut(),
-            grammar_triggers_count: 0,
-            preserved_tokens: ptr::null_mut(),
-            preserved_tokens_count: 0,
-            additional_stops: ptr::null_mut(),
-            additional_stops_count: 0,
-        };
+/// Renders `tmpl` with OpenAI-compatible JSON messages, reading special tokens from `model`.
+///
+/// A null `model` renders without special tokens, which llama.cpp allows only for a non-empty
+/// template.
+fn render_oaicompat(
+    model: *const llama_cpp_sys_2::llama_model,
+    tmpl: &LlamaChatTemplate,
+    params: &OpenAIChatTemplateParams<'_>,
+) -> Result<ChatTemplateResult, ApplyChatTemplateError> {
+    let parse_tool_calls = params.parse_tool_calls;
+    let messages_cstr = CString::new(params.messages_json)?;
+    let tools_cstr = params.tools_json.map(CString::new).transpose()?;
+    let tool_choice_cstr = params.tool_choice.map(CString::new).transpose()?;
+    let json_schema_cstr = params.json_schema.map(CString::new).transpose()?;
+    let grammar_cstr = params.grammar.map(CString::new).transpose()?;
+    let reasoning_cstr = params.reasoning_format.map(CString::new).transpose()?;
+    let kwargs_cstr = params.chat_template_kwargs.map(CString::new).transpose()?;
 
-        let ffi_params = llama_cpp_sys_2::llama_rs_chat_template_oaicompat_params {
-            messages: messages_cstr.as_ptr(),
-            tools: tools_cstr
-                .as_ref()
-                .map_or(ptr::null(), |cstr| cstr.as_ptr()),
-            tool_choice: tool_choice_cstr
-                .as_ref()
-                .map_or(ptr::null(), |cstr| cstr.as_ptr()),
-            json_schema: json_schema_cstr
-                .as_ref()
-                .map_or(ptr::null(), |cstr| cstr.as_ptr()),
-            grammar: grammar_cstr
-                .as_ref()
-                .map_or(ptr::null(), |cstr| cstr.as_ptr()),
-            reasoning_format: reasoning_cstr
-                .as_ref()
-                .map_or(ptr::null(), |cstr| cstr.as_ptr()),
-            chat_template_kwargs: kwargs_cstr
-                .as_ref()
-                .map_or(ptr::null(), |cstr| cstr.as_ptr()),
-            add_generation_prompt: params.add_generation_prompt,
-            use_jinja: params.use_jinja,
-            parallel_tool_calls: params.parallel_tool_calls,
-            enable_thinking: params.enable_thinking,
-            add_bos: params.add_bos,
-            add_eos: params.add_eos,
-        };
+    let mut raw_result = llama_cpp_sys_2::llama_rs_chat_template_result {
+        prompt: ptr::null_mut(),
+        grammar: ptr::null_mut(),
+        parser: ptr::null_mut(),
+        generation_prompt: ptr::null_mut(),
+        thinking_start_tag: ptr::null_mut(),
+        thinking_end_tags: ptr::null_mut(),
+        thinking_end_tags_count: 0,
+        supports_thinking: false,
+        chat_format: 0,
+        grammar_lazy: false,
+        grammar_triggers: ptr::null_mut(),
+        grammar_triggers_count: 0,
+        preserved_tokens: ptr::null_mut(),
+        preserved_tokens_count: 0,
+        additional_stops: ptr::null_mut(),
+        additional_stops_count: 0,
+    };
 
-        let rc = unsafe {
-            llama_cpp_sys_2::llama_rs_apply_chat_template_oaicompat(
-                self.model.as_ptr(),
-                tmpl.0.as_ptr(),
-                &ffi_params,
-                &mut raw_result,
-            )
-        };
+    let ffi_params = llama_cpp_sys_2::llama_rs_chat_template_oaicompat_params {
+        messages: messages_cstr.as_ptr(),
+        tools: tools_cstr
+            .as_ref()
+            .map_or(ptr::null(), |cstr| cstr.as_ptr()),
+        tool_choice: tool_choice_cstr
+            .as_ref()
+            .map_or(ptr::null(), |cstr| cstr.as_ptr()),
+        json_schema: json_schema_cstr
+            .as_ref()
+            .map_or(ptr::null(), |cstr| cstr.as_ptr()),
+        grammar: grammar_cstr
+            .as_ref()
+            .map_or(ptr::null(), |cstr| cstr.as_ptr()),
+        reasoning_format: reasoning_cstr
+            .as_ref()
+            .map_or(ptr::null(), |cstr| cstr.as_ptr()),
+        chat_template_kwargs: kwargs_cstr
+            .as_ref()
+            .map_or(ptr::null(), |cstr| cstr.as_ptr()),
+        add_generation_prompt: params.add_generation_prompt,
+        use_jinja: params.use_jinja,
+        parallel_tool_calls: params.parallel_tool_calls,
+        enable_thinking: params.enable_thinking,
+        add_bos: params.add_bos,
+        add_eos: params.add_eos,
+    };
 
-        let result = (|| {
-            if !status_is_ok(rc) {
-                return Err(ApplyChatTemplateError::FfiError(rc));
-            }
-            if raw_result.prompt.is_null() {
-                return Err(ApplyChatTemplateError::NullResult);
-            }
-            let prompt_bytes = unsafe { CStr::from_ptr(raw_result.prompt) }
+    let rc = unsafe {
+        llama_cpp_sys_2::llama_rs_apply_chat_template_oaicompat(
+            model,
+            tmpl.0.as_ptr(),
+            &ffi_params,
+            &mut raw_result,
+        )
+    };
+
+    let result = (|| {
+        if !status_is_ok(rc) {
+            return Err(ApplyChatTemplateError::FfiError(rc));
+        }
+        if raw_result.prompt.is_null() {
+            return Err(ApplyChatTemplateError::NullResult);
+        }
+        let prompt_bytes = unsafe { CStr::from_ptr(raw_result.prompt) }
+            .to_bytes()
+            .to_vec();
+        let prompt = String::from_utf8(prompt_bytes)?;
+        let grammar_lazy = raw_result.grammar_lazy;
+        let grammar = if raw_result.grammar.is_null() {
+            None
+        } else {
+            let grammar_bytes = unsafe { CStr::from_ptr(raw_result.grammar) }
                 .to_bytes()
                 .to_vec();
-            let prompt = String::from_utf8(prompt_bytes)?;
-            let grammar_lazy = raw_result.grammar_lazy;
-            let grammar = if raw_result.grammar.is_null() {
-                None
-            } else {
-                let grammar_bytes = unsafe { CStr::from_ptr(raw_result.grammar) }
-                    .to_bytes()
-                    .to_vec();
-                Some(String::from_utf8(grammar_bytes)?)
+            Some(String::from_utf8(grammar_bytes)?)
+        };
+        // SAFETY: The result owns this native syntax; taking it clears the pointer so the
+        // result cleanup cannot free the allocation the Rust handle now owns.
+        let parser = unsafe { ChatParserSyntax::take(&mut raw_result.parser) };
+        let generation_prompt = if raw_result.generation_prompt.is_null() {
+            String::new()
+        } else {
+            let generation_prompt_bytes = unsafe { CStr::from_ptr(raw_result.generation_prompt) }
+                .to_bytes()
+                .to_vec();
+            String::from_utf8(generation_prompt_bytes)?
+        };
+        let thinking_start_tag = optional_ffi_string(raw_result.thinking_start_tag)?;
+        let thinking_end_tags = ffi_string_array(
+            raw_result.thinking_end_tags,
+            raw_result.thinking_end_tags_count,
+        )?;
+        let grammar_triggers = if raw_result.grammar_triggers_count == 0 {
+            Vec::new()
+        } else if raw_result.grammar_triggers.is_null() {
+            return Err(ApplyChatTemplateError::InvalidGrammarTriggerType);
+        } else {
+            let triggers = unsafe {
+                slice::from_raw_parts(
+                    raw_result.grammar_triggers,
+                    raw_result.grammar_triggers_count,
+                )
             };
-            // SAFETY: The result owns this native syntax; taking it clears the pointer so the
-            // result cleanup cannot free the allocation the Rust handle now owns.
-            let parser = unsafe { ChatParserSyntax::take(&mut raw_result.parser) };
-            let generation_prompt = if raw_result.generation_prompt.is_null() {
-                String::new()
-            } else {
-                let generation_prompt_bytes =
-                    unsafe { CStr::from_ptr(raw_result.generation_prompt) }
-                        .to_bytes()
-                        .to_vec();
-                String::from_utf8(generation_prompt_bytes)?
-            };
-            let thinking_start_tag = optional_ffi_string(raw_result.thinking_start_tag)?;
-            let thinking_end_tags = ffi_string_array(
-                raw_result.thinking_end_tags,
-                raw_result.thinking_end_tags_count,
-            )?;
-            let grammar_triggers = if raw_result.grammar_triggers_count == 0 {
-                Vec::new()
-            } else if raw_result.grammar_triggers.is_null() {
-                return Err(ApplyChatTemplateError::InvalidGrammarTriggerType);
-            } else {
-                let triggers = unsafe {
-                    slice::from_raw_parts(
-                        raw_result.grammar_triggers,
-                        raw_result.grammar_triggers_count,
-                    )
+            let mut parsed = Vec::with_capacity(triggers.len());
+            for trigger in triggers {
+                let trigger_type = match trigger.type_ {
+                    0 => GrammarTriggerType::Token,
+                    1 => GrammarTriggerType::Word,
+                    2 => GrammarTriggerType::Pattern,
+                    3 => GrammarTriggerType::PatternFull,
+                    _ => return Err(ApplyChatTemplateError::InvalidGrammarTriggerType),
                 };
-                let mut parsed = Vec::with_capacity(triggers.len());
-                for trigger in triggers {
-                    let trigger_type = match trigger.type_ {
-                        0 => GrammarTriggerType::Token,
-                        1 => GrammarTriggerType::Word,
-                        2 => GrammarTriggerType::Pattern,
-                        3 => GrammarTriggerType::PatternFull,
-                        _ => return Err(ApplyChatTemplateError::InvalidGrammarTriggerType),
-                    };
-                    let value = if trigger.value.is_null() {
-                        String::new()
-                    } else {
-                        let bytes = unsafe { CStr::from_ptr(trigger.value) }.to_bytes().to_vec();
-                        String::from_utf8(bytes)?
-                    };
-                    let token = if trigger_type == GrammarTriggerType::Token {
-                        Some(LlamaToken(trigger.token))
-                    } else {
-                        None
-                    };
-                    parsed.push(GrammarTrigger {
-                        trigger_type,
-                        value,
-                        token,
-                    });
-                }
-                parsed
-            };
-            let preserved_tokens = ffi_string_array(
-                raw_result.preserved_tokens,
-                raw_result.preserved_tokens_count,
-            )?;
-            let additional_stops = ffi_string_array(
-                raw_result.additional_stops,
-                raw_result.additional_stops_count,
-            )?;
+                let value = if trigger.value.is_null() {
+                    String::new()
+                } else {
+                    let bytes = unsafe { CStr::from_ptr(trigger.value) }.to_bytes().to_vec();
+                    String::from_utf8(bytes)?
+                };
+                let token = if trigger_type == GrammarTriggerType::Token {
+                    Some(LlamaToken(trigger.token))
+                } else {
+                    None
+                };
+                parsed.push(GrammarTrigger {
+                    trigger_type,
+                    value,
+                    token,
+                });
+            }
+            parsed
+        };
+        let preserved_tokens = ffi_string_array(
+            raw_result.preserved_tokens,
+            raw_result.preserved_tokens_count,
+        )?;
+        let additional_stops = ffi_string_array(
+            raw_result.additional_stops,
+            raw_result.additional_stops_count,
+        )?;
 
-            Ok(ChatTemplateResult {
-                prompt,
-                grammar,
-                grammar_lazy,
-                grammar_triggers,
-                preserved_tokens,
-                additional_stops,
-                chat_format: raw_result.chat_format,
-                parser,
-                generation_prompt,
-                thinking_start_tag,
-                thinking_end_tags,
-                supports_thinking: raw_result.supports_thinking,
-                parse_tool_calls,
-            })
-        })();
+        Ok(ChatTemplateResult {
+            prompt,
+            grammar,
+            grammar_lazy,
+            grammar_triggers,
+            preserved_tokens,
+            additional_stops,
+            chat_format: raw_result.chat_format,
+            parser,
+            generation_prompt,
+            thinking_start_tag,
+            thinking_end_tags,
+            supports_thinking: raw_result.supports_thinking,
+            parse_tool_calls,
+        })
+    })();
 
-        unsafe { llama_cpp_sys_2::llama_rs_chat_template_result_free(&mut raw_result) };
-        result
-    }
+    unsafe { llama_cpp_sys_2::llama_rs_chat_template_result_free(&mut raw_result) };
+    result
 }
 
 /// Duplicates an optional wrapper-owned C string into an owned Rust string.

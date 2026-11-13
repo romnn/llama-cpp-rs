@@ -393,6 +393,9 @@ pub enum ApplyChatTemplateError {
     /// llama.cpp returned a null pointer for the template result.
     #[error("null result from llama.cpp")]
     NullResult,
+    /// rendering without a model needs a non-empty template.
+    #[error("a chat template is required to render without a model")]
+    MissingTemplate,
     /// llama.cpp returned an error code.
     #[error("ffi error {0}")]
     FfiError(i32),
