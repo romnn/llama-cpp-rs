@@ -950,6 +950,16 @@ fn main() {
         },
     );
     config.define("LLAMA_CURL", "OFF");
+    // HTTPS for llama.cpp's built-in model downloader, which no binding calls. Off unless asked for,
+    // so the build no longer depends on whether CMake finds an OpenSSL on the build machine.
+    config.define(
+        "LLAMA_OPENSSL",
+        if cfg!(feature = "openssl") {
+            "ON"
+        } else {
+            "OFF"
+        },
+    );
 
     // Pass CMAKE_ environment variables down to CMake
     for (key, value) in env::vars() {

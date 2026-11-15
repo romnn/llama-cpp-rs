@@ -30,6 +30,8 @@ default = ["openmp", "android-shared-stdcxx", "common"]
 # bindings (~10 MB combined) from the link line. Enabled by default for
 # backwards compatibility.
 common = ["llama-cpp-sys-2/common"]
+# HTTPS for llama.cpp's built-in model downloader; see the feature of the same name in the sys crate.
+openssl = ["llama-cpp-sys-2/openssl"]
 cuda = ["llama-cpp-sys-2/cuda"]
 cuda-no-vmm = ["cuda", "llama-cpp-sys-2/cuda-no-vmm"]
 metal = ["llama-cpp-sys-2/metal"]

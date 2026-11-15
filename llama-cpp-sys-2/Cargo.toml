@@ -82,6 +82,10 @@ default = ["common"]
 # for size-constrained downstream binaries that only need the core inference
 # API. Enabled by default to preserve backwards compatibility.
 common = []
+# HTTPS for llama.cpp's built-in model downloader (`common/download.cpp`), which no binding exposes.
+# It links whichever OpenSSL CMake finds on the build machine, such as Homebrew's on macOS, so a
+# binary built with it can fail to load on a machine without that same library.
+openssl = []
 # Backend selection. When `system-ggml` is also enabled, each backend feature
 # is propagated into ggml-sys via `ggml-sys?/<backend>` (`?` only activates the
 # feature if ggml-sys is already in the dep graph). This guarantees the
