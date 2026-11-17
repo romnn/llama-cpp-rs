@@ -298,6 +298,12 @@ impl LlamaModel {
         unsafe { llama_cpp_sys_2::llama_model_is_hybrid(self.model.as_ptr()) }
     }
 
+    /// Returns the size of the model's sliding attention window, or 0 when it has none.
+    pub fn n_swa(&self) -> u32 {
+        u32::try_from(unsafe { llama_cpp_sys_2::llama_model_n_swa(self.model.as_ptr()) })
+            .unwrap_or(0)
+    }
+
     /// Returns the number of layers within the model.
     pub fn n_layer(&self) -> u32 {
         // It's never possible for this to panic because while the API interface is defined as an int32_t,
