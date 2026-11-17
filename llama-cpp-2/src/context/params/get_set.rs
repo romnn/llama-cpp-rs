@@ -129,6 +129,44 @@ impl LlamaContextParams {
         self.context_params.n_seq_max
     }
 
+    /// Set the most outputs one batch may request, `0` meaning `n_batch`.
+    ///
+    /// llama.cpp sizes the context's compute and output buffers for this many rows of logits, so
+    /// a context that only ever samples a few positions per batch, such as a speculative draft
+    /// context, holds far less memory with a small value.
+    ///
+    /// The cap covers a whole batch passed to a decode, not each of its ubatches, and it must be
+    /// at least [`Self::n_seq_max`].
+    /// llama.cpp aborts the process when a batch requests more outputs, or when the context is
+    /// created with a cap below its sequence count.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use llama_cpp_2::context::params::LlamaContextParams;
+    /// let params = LlamaContextParams::default().with_n_outputs_max(4);
+    /// assert_eq!(params.n_outputs_max(), 4);
+    /// ```
+    #[must_use]
+    pub fn with_n_outputs_max(mut self, n_outputs_max: u32) -> Self {
+        self.context_params.n_outputs_max = n_outputs_max;
+        self
+    }
+
+    /// Get the most outputs one batch may request, `0` meaning `n_batch`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use llama_cpp_2::context::params::LlamaContextParams;
+    /// let params = LlamaContextParams::default();
+    /// assert_eq!(params.n_outputs_max(), 0);
+    /// ```
+    #[must_use]
+    pub fn n_outputs_max(&self) -> u32 {
+        self.context_params.n_outputs_max
+    }
+
     /// Set the number of recurrent-state rollback snapshots per sequence.
     ///
     /// MTP speculative decoding uses this on the target context so llama.cpp can
