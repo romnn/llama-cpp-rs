@@ -235,6 +235,23 @@ extern "C" {
     ) -> llama_rs_status;
 }
 extern "C" {
+    pub fn llama_rs_mtp_speculative_get_state(
+        spec: *const llama_rs_mtp_speculative,
+        seq_id: llama_seq_id,
+        out: *mut u8,
+        capacity: usize,
+        out_len: *mut usize,
+    ) -> llama_rs_status;
+}
+extern "C" {
+    pub fn llama_rs_mtp_speculative_set_state(
+        spec: *mut llama_rs_mtp_speculative,
+        seq_id: llama_seq_id,
+        data: *const u8,
+        len: usize,
+    ) -> llama_rs_status;
+}
+extern "C" {
     pub fn llama_rs_chat_template_result_free(result: *mut llama_rs_chat_template_result);
 }
 extern "C" {

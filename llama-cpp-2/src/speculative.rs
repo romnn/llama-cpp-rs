@@ -435,6 +435,59 @@ impl<'model> MtpSpeculative<'model> {
         };
         status_to_result(status)
     }
+
+    /// The drafter's state for `seq_id`: the target hidden state its next draft continues from.
+    ///
+    /// A context checkpoint of the target saves this beside it, because restoring the target's
+    /// sequence alone would leave the drafter continuing from wherever the sequence ended before.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MtpSpeculativeError::Status`] when `seq_id` is out of range.
+    pub fn state(&self, seq_id: i32) -> Result<Vec<u8>, MtpSpeculativeError> {
+        let mut len = 0;
+        let status = unsafe {
+            llama_cpp_sys_2::llama_rs_mtp_speculative_get_state(
+                self.raw.as_ptr(),
+                seq_id,
+                std::ptr::null_mut(),
+                0,
+                &raw mut len,
+            )
+        };
+        status_to_result(status)?;
+        let mut state = vec![0; len];
+        let status = unsafe {
+            llama_cpp_sys_2::llama_rs_mtp_speculative_get_state(
+                self.raw.as_ptr(),
+                seq_id,
+                state.as_mut_ptr(),
+                state.len(),
+                &raw mut len,
+            )
+        };
+        status_to_result(status)?;
+        state.truncate(len);
+        Ok(state)
+    }
+
+    /// Restores a state [`Self::state`] returned for `seq_id` of this drafter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MtpSpeculativeError::Status`] when `seq_id` is out of range or `state` has
+    /// another size than this drafter's.
+    pub fn set_state(&mut self, seq_id: i32, state: &[u8]) -> Result<(), MtpSpeculativeError> {
+        let status = unsafe {
+            llama_cpp_sys_2::llama_rs_mtp_speculative_set_state(
+                self.raw.as_ptr(),
+                seq_id,
+                state.as_ptr(),
+                state.len(),
+            )
+        };
+        status_to_result(status)
+    }
 }
 
 impl Drop for MtpSpeculative<'_> {

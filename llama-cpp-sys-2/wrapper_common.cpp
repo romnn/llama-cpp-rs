@@ -705,3 +705,51 @@ extern "C" llama_rs_status llama_rs_mtp_speculative_accept(
         return LLAMA_RS_STATUS_EXCEPTION;
     }
 }
+
+extern "C" llama_rs_status llama_rs_mtp_speculative_get_state(
+    const struct llama_rs_mtp_speculative * spec,
+    llama_seq_id seq_id,
+    uint8_t * out,
+    size_t capacity,
+    size_t * out_len) {
+    if (!spec || !spec->spec || !out_len || seq_id < 0 || (uint32_t) seq_id >= spec->n_seq) {
+        return LLAMA_RS_STATUS_INVALID_ARGUMENT;
+    }
+
+    try {
+        std::vector<uint8_t> state;
+        if (!common_speculative_get_state(spec->spec, seq_id, state)) {
+            return LLAMA_RS_STATUS_INVALID_ARGUMENT;
+        }
+        *out_len = state.size();
+        if (out && capacity >= state.size()) {
+            std::memcpy(out, state.data(), state.size());
+        }
+        return LLAMA_RS_STATUS_OK;
+    } catch (...) {
+        return LLAMA_RS_STATUS_EXCEPTION;
+    }
+}
+
+extern "C" llama_rs_status llama_rs_mtp_speculative_set_state(
+    struct llama_rs_mtp_speculative * spec,
+    llama_seq_id seq_id,
+    const uint8_t * data,
+    size_t len) {
+    if (!spec || !spec->spec || (!data && len > 0) || seq_id < 0 || (uint32_t) seq_id >= spec->n_seq) {
+        return LLAMA_RS_STATUS_INVALID_ARGUMENT;
+    }
+
+    try {
+        // `common_speculative_set_state` ignores a state of the wrong size, which would leave the
+        // drafter continuing from whatever it held before.
+        std::vector<uint8_t> current;
+        if (!common_speculative_get_state(spec->spec, seq_id, current) || current.size() != len) {
+            return LLAMA_RS_STATUS_INVALID_ARGUMENT;
+        }
+        common_speculative_set_state(spec->spec, seq_id, std::vector<uint8_t>(data, data + len));
+        return LLAMA_RS_STATUS_OK;
+    } catch (...) {
+        return LLAMA_RS_STATUS_EXCEPTION;
+    }
+}

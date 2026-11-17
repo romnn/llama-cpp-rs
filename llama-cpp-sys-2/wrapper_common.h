@@ -216,6 +216,24 @@ llama_rs_status llama_rs_mtp_speculative_accept(
     llama_seq_id seq_id,
     uint16_t n_accepted);
 
+// The drafter's state for one sequence, the target hidden state its next draft continues from, as
+// `common_speculative_get_state` captures it beside a context checkpoint.
+// Writes the state's size to `out_len`, and the state to `out` when `capacity` holds it.
+llama_rs_status llama_rs_mtp_speculative_get_state(
+    const struct llama_rs_mtp_speculative * spec,
+    llama_seq_id seq_id,
+    uint8_t * out,
+    size_t capacity,
+    size_t * out_len);
+
+// Restores a state `llama_rs_mtp_speculative_get_state` returned for the same drafter.
+// A state of another size is refused rather than ignored.
+llama_rs_status llama_rs_mtp_speculative_set_state(
+    struct llama_rs_mtp_speculative * spec,
+    llama_seq_id seq_id,
+    const uint8_t * data,
+    size_t len);
+
 void llama_rs_chat_template_result_free(struct llama_rs_chat_template_result * result);
 void llama_rs_string_free(char * ptr);
 
