@@ -3,7 +3,7 @@
 use crate::context::params::LlamaContextParams;
 use crate::model::params::kv_overrides::KvOverrides;
 use crate::LlamaCppError;
-use std::ffi::{c_char, c_void, CStr};
+use std::ffi::{c_char, c_void, CStr, CString};
 use std::fmt::{Debug, Formatter};
 use std::pin::Pin;
 use std::ptr::null;
@@ -159,6 +159,9 @@ pub struct LlamaModelParams {
     pub(crate) params: llama_cpp_sys_2::llama_model_params,
     kv_overrides: Vec<llama_cpp_sys_2::llama_model_kv_override>,
     buft_overrides: Vec<llama_cpp_sys_2::llama_model_tensor_buft_override>,
+    /// The patterns `buft_overrides` points into for the overrides added through these
+    /// parameters, owned here so no caller's string has to outlive them.
+    buft_patterns: Vec<CString>,
     devices: Pin<Box<[llama_cpp_sys_2::ggml_backend_dev_t; LLAMA_CPP_MAX_DEVICES]>>,
     tensor_split: Vec<f32>,
     progress_callback: Option<Box<dyn FnMut(f32) -> bool>>,
@@ -258,44 +261,150 @@ impl LlamaModelParams {
     }
 }
 
+/// The tensor-name pattern llama.cpp matches a mixture-of-experts model's routed expert weights
+/// with, its `LLM_FFN_EXPS_REGEX`.
+///
+/// It covers separate up, down and gate tensors and fused gate-up tensors, chunked or not, and
+/// never a shared expert's (`_shexp`) tensors.
+/// It is kept here rather than read from llama.cpp's `common` library, so builds without that
+/// library can place experts too; a test of the `common` build checks the two agree.
+pub const LLM_FFN_EXPS_REGEX: &str = r"\.ffn_(up|down|gate|gate_up)_(ch|)exps";
+
+/// The pattern that matches the routed expert tensors of blocks `0..blocks`, as one alternation
+/// so llama.cpp's loader, which compiles every override's pattern for every tensor, compiles one.
+fn expert_prefix_pattern(blocks: u32) -> String {
+    let indices = (0..blocks)
+        .map(|block| block.to_string())
+        .collect::<Vec<_>>()
+        .join("|");
+    format!(r"blk\.({indices}){LLM_FFN_EXPS_REGEX}")
+}
+
+/// The routed expert weights of a mixture-of-experts GGUF file, block by block.
+#[cfg(feature = "common")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpertTensorBytes {
+    /// Bytes of each block's routed expert tensors, by block index, zero for a block without
+    /// routed experts.
+    pub block_bytes: Vec<u64>,
+    /// How many of the last blocks are multi-token-prediction (`NextN`) blocks, which llama.cpp
+    /// loads only for speculative decoding.
+    pub nextn_blocks: u32,
+}
+
+/// Reads how many bytes the routed experts of each block of the GGUF file at `path` take, from
+/// its tensor table, without loading any weights.
+///
+/// Expert tensors are the ones llama.cpp's loader matches with its own `LLM_FFN_EXPS_REGEX`, so a
+/// dense model reports zero bytes for every block.
+/// Returns `None` for a path or file that cannot be read.
+#[cfg(feature = "common")]
+#[must_use]
+pub fn model_file_expert_bytes(path: &std::path::Path) -> Option<ExpertTensorBytes> {
+    let path = CString::new(path.to_str()?).ok()?;
+    // Enough for every model llama.cpp knows of; a file with more blocks is read a second time.
+    let mut block_bytes = vec![0_u64; 256];
+    loop {
+        let mut block_count = 0_usize;
+        let mut nextn_blocks = 0_u32;
+        // SAFETY: `path` is NUL-terminated, `block_bytes` holds `block_bytes.len()` writable
+        // entries, and both counts are valid for writes, all for the duration of the call.
+        let status = unsafe {
+            llama_cpp_sys_2::llama_rs_model_file_expert_bytes(
+                path.as_ptr(),
+                block_bytes.as_mut_ptr(),
+                block_bytes.len(),
+                &raw mut block_count,
+                &raw mut nextn_blocks,
+            )
+        };
+        if !crate::status_is_ok(status) {
+            return None;
+        }
+        if block_count <= block_bytes.len() {
+            block_bytes.truncate(block_count);
+            return Some(ExpertTensorBytes {
+                block_bytes,
+                nextn_blocks,
+            });
+        }
+        block_bytes = vec![0; block_count];
+    }
+}
+
 impl LlamaModelParams {
-    /// Adds buffer type overides to move all mixture-of-experts layers to CPU.
-    pub fn add_cpu_moe_override(self: Pin<&mut Self>) {
-        self.add_cpu_buft_override(c"\\.ffn_(up|down|gate)_(ch|)exps");
+    /// Adds a buffer type override that keeps every routed expert of a mixture-of-experts model
+    /// in system memory, as llama.cpp's `--cpu-moe` does.
+    pub fn add_cpu_moe_override(&mut self) {
+        self.add_cpu_buft_override_pattern(LLM_FFN_EXPS_REGEX);
     }
 
-    /// Appends a buffer type override to the model parameters, to move layers matching pattern to CPU.
-    /// It must be pinned as this creates a self-referential struct.
-    pub fn add_cpu_buft_override(mut self: Pin<&mut Self>, key: &CStr) {
-        let buft_override = self
-            .buft_overrides
-            .last_mut()
-            .expect("buft_overrides did not have a next allocated");
+    /// Appends a buffer type override that keeps the tensors whose names match `pattern` in
+    /// system memory, whatever layers are offloaded.
+    ///
+    /// The parameters keep their own copy of `pattern`, so the caller's string may be dropped
+    /// right after the call.
+    /// Overrides apply in the order they were added, the first match deciding a tensor's buffer.
+    pub fn add_cpu_buft_override(&mut self, pattern: &CStr) {
+        self.push_cpu_buft_override(pattern.to_owned());
+    }
 
-        assert!(
-            buft_override.pattern.is_null(),
-            "last buft_override was not empty"
-        );
-
-        // There should be some way to do this without iterating over everything.
-        for &c in key.to_bytes_with_nul().iter() {
-            c_char::try_from(c).expect("invalid character in key");
+    /// Keeps the routed experts of the model's first `blocks` blocks in system memory, as
+    /// llama.cpp's `--n-cpu-moe` does, with every other tensor placed as the layer split says.
+    ///
+    /// Zero blocks adds no override.
+    #[must_use]
+    pub fn with_cpu_expert_prefix(mut self, blocks: u32) -> Self {
+        if blocks > 0 {
+            self.add_cpu_buft_override_pattern(&expert_prefix_pattern(blocks));
         }
+        self
+    }
 
-        buft_override.pattern = key.as_ptr();
-        buft_override.buft = unsafe { llama_cpp_sys_2::ggml_backend_cpu_buffer_type() };
+    /// Keeps every routed expert in system memory, the multi-token-prediction blocks' included,
+    /// as llama.cpp's `--cpu-moe` does.
+    #[must_use]
+    pub fn with_cpu_all_experts(mut self) -> Self {
+        self.add_cpu_moe_override();
+        self
+    }
 
-        // set to null pointer for panic safety (as push may move the vector, invalidating the pointer)
+    /// [`Self::add_cpu_buft_override`] for a pattern built in Rust.
+    fn add_cpu_buft_override_pattern(&mut self, pattern: &str) {
+        #[allow(clippy::expect_used)]
+        let pattern = CString::new(pattern).expect("override patterns never contain a NUL byte");
+        self.push_cpu_buft_override(pattern);
+    }
+
+    fn push_cpu_buft_override(&mut self, pattern: CString) {
+        let entry = llama_cpp_sys_2::llama_model_tensor_buft_override {
+            // A `CString` keeps its bytes on the heap, so the pointer stays valid as the vector of
+            // owned patterns grows and as these parameters move.
+            pattern: pattern.as_ptr(),
+            // SAFETY: the CPU buffer type is a static of ggml's CPU backend, valid for the process.
+            buft: unsafe { llama_cpp_sys_2::ggml_backend_cpu_buffer_type() },
+        };
+        self.buft_patterns.push(pattern);
+
+        // Clear the pointer while the array changes, as resizing it may move it.
         self.params.tensor_buft_overrides = null();
 
-        // push the next one to ensure we maintain the iterator invariant of ending with a 0
+        // The new override goes before the first null entry, which ends the list llama.cpp reads,
+        // and a fresh terminator follows it.
+        // A list `fit_params` filled holds null entries past its terminator, which are dropped.
+        let terminator = self
+            .buft_overrides
+            .iter()
+            .position(|buft_override| buft_override.pattern.is_null())
+            .unwrap_or(self.buft_overrides.len());
+        self.buft_overrides.truncate(terminator);
+        self.buft_overrides.push(entry);
         self.buft_overrides
             .push(llama_cpp_sys_2::llama_model_tensor_buft_override {
                 pattern: std::ptr::null(),
                 buft: std::ptr::null_mut(),
             });
 
-        // set the pointer to the (potentially) new vector
         self.params.tensor_buft_overrides = self.buft_overrides.as_ptr();
     }
 
@@ -308,20 +417,19 @@ impl LlamaModelParams {
     /// the routed-expert tensors (`blk.<N>.ffn_(up|down|gate_up|gate)_(ch|)exps`) a
     /// mixture-of-experts fit assigns to the CPU buffer type to make the model fit. Returns an empty
     /// vector when no overrides are set. The trailing null-terminator entry the override list
-    /// carries is skipped; only entries with a non-null pattern are returned.
+    /// carries is skipped; only entries before it are returned.
     #[must_use]
     pub fn tensor_buft_override_patterns(&self) -> Vec<String> {
         self.buft_overrides
             .iter()
-            .filter(|o| !o.pattern.is_null())
+            .take_while(|o| !o.pattern.is_null())
             .map(|o| {
-                // SAFETY: a non-null `pattern` is a NUL-terminated C string. For fit-produced
-                // overrides it points into process-lifetime function-local `static` storage in
-                // llama.cpp's `common/fit.cpp`, so it is always valid to read here. For overrides set
-                // via `add_cpu_buft_override` the pointer is borrowed from the caller's `&CStr` with
-                // no lifetime tie recorded on the params, so that setter's callers are responsible
-                // for keeping the string alive at least as long as the params; every in-tree caller
-                // passes a `'static` literal. In both cases the string outlives this `&self` borrow.
+                // SAFETY: a non-null `pattern` is a NUL-terminated C string.
+                // For fit-produced overrides it points into process-lifetime function-local
+                // `static` storage in llama.cpp's `common/fit.cpp`.
+                // For overrides added through these parameters it points into a `CString` they
+                // own and keep until they drop.
+                // In both cases the string outlives this `&self` borrow.
                 unsafe { CStr::from_ptr(o.pattern) }
                     .to_string_lossy()
                     .into_owned()
@@ -387,6 +495,7 @@ impl LlamaModelParams {
 
         // Reset and resize buft_overrides for fit output (null-terminated).
         self.buft_overrides.clear();
+        self.buft_patterns.clear();
         self.buft_overrides.resize(
             max_buft + 1,
             llama_cpp_sys_2::llama_model_tensor_buft_override {
@@ -725,6 +834,7 @@ impl Default for LlamaModelParams {
                 pattern: std::ptr::null(),
                 buft: std::ptr::null_mut(),
             }],
+            buft_patterns: Vec::new(),
             devices: Box::pin([std::ptr::null_mut(); 16]),
             tensor_split: Vec::new(),
             progress_callback: None,
@@ -756,7 +866,117 @@ mod tests {
         params.as_mut().add_cpu_moe_override();
         assert_eq!(
             params.tensor_buft_override_patterns(),
-            vec!["\\.ffn_(up|down|gate)_(ch|)exps".to_owned()],
+            vec![super::LLM_FFN_EXPS_REGEX.to_owned()],
+        );
+    }
+
+    #[test]
+    fn tensor_buft_override_patterns_outlive_the_callers_string_and_moves() {
+        // The parameters own their copy of each pattern, so the caller's string may go before
+        // the parameters are read or moved.
+        let mut params = LlamaModelParams::default();
+        {
+            let pattern = std::ffi::CString::new("blk\\.7\\.ffn_up_exps").unwrap();
+            params.add_cpu_buft_override(&pattern);
+        }
+        let moved = Box::new(params);
+        let moved = *moved;
+        assert_eq!(
+            moved.tensor_buft_override_patterns(),
+            vec!["blk\\.7\\.ffn_up_exps".to_owned()],
+        );
+        // The array llama.cpp reads starts at the owned entries and ends with a null terminator.
+        assert_eq!(moved.params.tensor_buft_overrides, moved.buft_overrides.as_ptr());
+        assert!(moved
+            .buft_overrides
+            .last()
+            .is_some_and(|terminator| terminator.pattern.is_null()));
+    }
+
+    #[test]
+    fn tensor_buft_overrides_keep_the_order_they_were_added_in() {
+        let mut params = LlamaModelParams::default()
+            .with_cpu_expert_prefix(2)
+            .with_cpu_all_experts();
+        params.add_cpu_buft_override(c"output\\.weight");
+
+        assert_eq!(
+            params.tensor_buft_override_patterns(),
+            vec![
+                format!("blk\\.(0|1){}", super::LLM_FFN_EXPS_REGEX),
+                super::LLM_FFN_EXPS_REGEX.to_owned(),
+                "output\\.weight".to_owned(),
+            ],
+        );
+        assert_eq!(params.buft_overrides.len(), 4);
+    }
+
+    #[test]
+    fn an_expert_prefix_of_no_blocks_adds_no_override() {
+        assert!(LlamaModelParams::default()
+            .with_cpu_expert_prefix(0)
+            .tensor_buft_override_patterns()
+            .is_empty());
+    }
+
+    #[test]
+    fn expert_patterns_match_routed_experts_and_never_shared_ones() {
+        // llama.cpp matches these with `std::regex_search`; the patterns use only syntax the
+        // `regex` crate reads the same way.
+        let prefix = regex::Regex::new(&super::expert_prefix_pattern(3)).unwrap();
+        let all = regex::Regex::new(super::LLM_FFN_EXPS_REGEX).unwrap();
+        for routed in [
+            "blk.0.ffn_up_exps.weight",
+            "blk.1.ffn_down_exps.weight",
+            "blk.2.ffn_gate_exps.weight",
+            "blk.2.ffn_gate_up_exps.weight",
+            "blk.0.ffn_down_chexps.weight",
+        ] {
+            assert!(prefix.is_match(routed), "{routed}");
+            assert!(all.is_match(routed), "{routed}");
+        }
+        // Blocks past the prefix, including ones whose index starts with a prefix block's.
+        for later in ["blk.3.ffn_up_exps.weight", "blk.12.ffn_gate_up_exps.weight"] {
+            assert!(!prefix.is_match(later), "{later}");
+            assert!(all.is_match(later), "{later}");
+        }
+        for other in [
+            "blk.0.ffn_up_shexp.weight",
+            "blk.0.ffn_gate_inp.weight",
+            "blk.0.ffn_up.weight",
+            "blk.0.attn_q.weight",
+        ] {
+            assert!(!prefix.is_match(other), "{other}");
+            assert!(!all.is_match(other), "{other}");
+        }
+    }
+
+    #[cfg(feature = "common")]
+    #[test]
+    fn the_expert_pattern_is_llama_cpps() {
+        // SAFETY: the shim returns a pointer to llama.cpp's static NUL-terminated pattern.
+        let upstream = unsafe { std::ffi::CStr::from_ptr(llama_cpp_sys_2::llama_rs_ffn_exps_regex()) };
+        assert_eq!(upstream.to_str(), Ok(super::LLM_FFN_EXPS_REGEX));
+    }
+
+    #[cfg(feature = "common")]
+    #[test]
+    fn a_model_without_routed_experts_reports_none() {
+        // A vocabulary-only BERT file: a readable GGUF with no expert tensors in any block.
+        let bytes = super::model_file_expert_bytes(std::path::Path::new(
+            "src/gguf/ggml-vocab-bert-bge.gguf",
+        ))
+        .unwrap();
+        assert!(bytes.block_bytes.iter().all(|&block| block == 0));
+        assert_eq!(bytes.nextn_blocks, 0);
+    }
+
+    #[cfg(feature = "common")]
+    #[test]
+    fn a_file_that_cannot_be_read_has_no_expert_bytes() {
+        assert_eq!(
+            super::model_file_expert_bytes(std::path::Path::new("/nonexistent/model.gguf")),
+            None
         );
     }
 

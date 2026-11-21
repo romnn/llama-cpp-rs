@@ -1238,6 +1238,7 @@ dependencies = [
  "enumflags2",
  "llama-cpp-sys-2",
  "llguidance",
+ "regex",
  "static_assertions",
  "thiserror",
  "toktrie",
