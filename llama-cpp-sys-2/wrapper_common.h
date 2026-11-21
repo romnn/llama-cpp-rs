@@ -164,6 +164,25 @@ llama_rs_status llama_rs_estimate_memory_breakdown(
 // False for a file that cannot be read.
 bool llama_rs_model_file_has_mtp_layers(const char * path);
 
+// llama.cpp's `LLM_FFN_EXPS_REGEX`, the pattern its loader and `--cpu-moe` match a
+// mixture-of-experts model's routed expert tensors with.
+const char * llama_rs_ffn_exps_regex(void);
+
+// The routed expert tensor bytes of each block of the GGUF file at `path`, read from its tensor
+// table without loading any weights, with experts matched by `LLM_FFN_EXPS_REGEX` as llama.cpp's
+// loader matches them.
+// Writes the bytes of block `i` to `out_block_bytes[i]` for every block below `capacity`, the
+// number of blocks to `out_block_count`, and how many of the last blocks are
+// multi-token-prediction (NextN) blocks to `out_nextn_count`.
+// A file with more blocks than `capacity` still reports its count, so the caller can ask again
+// with room for every block.
+llama_rs_status llama_rs_model_file_expert_bytes(
+    const char * path,
+    uint64_t * out_block_bytes,
+    size_t capacity,
+    size_t * out_block_count,
+    uint32_t * out_nextn_count);
+
 // How the context's memory can remove positions from a sequence, as `common_context_can_seq_rm`
 // classifies it: 0 not at all, 1 any range, 2 whole sequences only, 3 the newest `n_rs_seq`
 // positions.

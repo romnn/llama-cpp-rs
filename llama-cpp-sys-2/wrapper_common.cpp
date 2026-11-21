@@ -5,6 +5,7 @@
 #include <cstring>
 #include <exception>
 #include <memory>
+#include <regex>
 #include <string>
 #include <stdint.h>
 #include <vector>
@@ -16,6 +17,7 @@
 #include "llama.cpp/common/json-schema-to-grammar.h"
 #include "llama.cpp/common/reasoning-budget.h"
 #include "llama.cpp/common/speculative.h"
+#include "llama.cpp/ggml/include/gguf.h"
 #include "llama.cpp/include/llama.h"
 #include "llama.cpp/src/llama-ext.h"
 #include "wrapper_utils.h"
@@ -476,6 +478,108 @@ extern "C" bool llama_rs_model_file_has_mtp_layers(const char * path) {
         return std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end();
     } catch (...) {
         return false;
+    }
+}
+
+extern "C" const char * llama_rs_ffn_exps_regex(void) {
+    return LLM_FFN_EXPS_REGEX;
+}
+
+// The integer value of `key` in `ctx`, or 0 when the file has no such key or holds another type.
+static uint64_t llama_rs_gguf_unsigned(const gguf_context * ctx, const std::string & key) {
+    const int64_t key_id = gguf_find_key(ctx, key.c_str());
+    if (key_id < 0) {
+        return 0;
+    }
+    switch (gguf_get_kv_type(ctx, key_id)) {
+        case GGUF_TYPE_UINT8:  return gguf_get_val_u8(ctx, key_id);
+        case GGUF_TYPE_UINT16: return gguf_get_val_u16(ctx, key_id);
+        case GGUF_TYPE_UINT32: return gguf_get_val_u32(ctx, key_id);
+        case GGUF_TYPE_UINT64: return gguf_get_val_u64(ctx, key_id);
+        case GGUF_TYPE_INT8:   return std::max<int64_t>(gguf_get_val_i8(ctx, key_id), 0);
+        case GGUF_TYPE_INT16:  return std::max<int64_t>(gguf_get_val_i16(ctx, key_id), 0);
+        case GGUF_TYPE_INT32:  return std::max<int64_t>(gguf_get_val_i32(ctx, key_id), 0);
+        case GGUF_TYPE_INT64:  return std::max<int64_t>(gguf_get_val_i64(ctx, key_id), 0);
+        default:               return 0;
+    }
+}
+
+// The block index of a tensor named `blk.<index>.<rest>`, or -1 for a tensor outside the blocks.
+static int64_t llama_rs_tensor_block(const char * name) {
+    static const char prefix[] = "blk.";
+    if (std::strncmp(name, prefix, sizeof(prefix) - 1) != 0) {
+        return -1;
+    }
+    const char * digits = name + sizeof(prefix) - 1;
+    char * end = nullptr;
+    const long long block = std::strtoll(digits, &end, 10);
+    if (end == digits || *end != '.' || block < 0) {
+        return -1;
+    }
+    return block;
+}
+
+extern "C" llama_rs_status llama_rs_model_file_expert_bytes(
+    const char * path,
+    uint64_t * out_block_bytes,
+    size_t capacity,
+    size_t * out_block_count,
+    uint32_t * out_nextn_count) {
+    if (!path || !out_block_count || !out_nextn_count || (capacity > 0 && !out_block_bytes)) {
+        return LLAMA_RS_STATUS_INVALID_ARGUMENT;
+    }
+    *out_block_count = 0;
+    *out_nextn_count = 0;
+
+    try {
+        gguf_init_params params = {
+            /*.no_alloc =*/ true,
+            /*.ctx      =*/ nullptr,
+        };
+        std::unique_ptr<gguf_context, decltype(&gguf_free)> ctx(
+            gguf_init_from_file(path, params),
+            gguf_free);
+        if (!ctx) {
+            return LLAMA_RS_STATUS_EXCEPTION;
+        }
+
+        std::string arch;
+        const int64_t arch_id = gguf_find_key(ctx.get(), "general.architecture");
+        if (arch_id >= 0 && gguf_get_kv_type(ctx.get(), arch_id) == GGUF_TYPE_STRING) {
+            arch = gguf_get_val_str(ctx.get(), arch_id);
+        }
+        const uint64_t declared_blocks = llama_rs_gguf_unsigned(ctx.get(), arch + ".block_count");
+        const uint64_t nextn_blocks =
+            llama_rs_gguf_unsigned(ctx.get(), arch + ".nextn_predict_layers");
+
+        std::vector<uint64_t> block_bytes(static_cast<size_t>(declared_blocks), 0);
+        const std::regex experts(LLM_FFN_EXPS_REGEX);
+        const int64_t n_tensors = gguf_get_n_tensors(ctx.get());
+        for (int64_t tensor_id = 0; tensor_id < n_tensors; ++tensor_id) {
+            const char * name = gguf_get_tensor_name(ctx.get(), tensor_id);
+            if (!name || !std::regex_search(name, experts)) {
+                continue;
+            }
+            const int64_t block = llama_rs_tensor_block(name);
+            if (block < 0) {
+                continue;
+            }
+            if (static_cast<uint64_t>(block) >= block_bytes.size()) {
+                block_bytes.resize(static_cast<size_t>(block) + 1, 0);
+            }
+            block_bytes[static_cast<size_t>(block)] += gguf_get_tensor_size(ctx.get(), tensor_id);
+        }
+
+        *out_block_count = block_bytes.size();
+        *out_nextn_count = static_cast<uint32_t>(
+            std::min<uint64_t>(nextn_blocks, block_bytes.size()));
+        const size_t written = std::min(capacity, block_bytes.size());
+        std::copy(block_bytes.begin(), block_bytes.begin() + written, out_block_bytes);
+        return LLAMA_RS_STATUS_OK;
+    } catch (const std::exception &) {
+        return LLAMA_RS_STATUS_EXCEPTION;
+    } catch (...) {
+        return LLAMA_RS_STATUS_EXCEPTION;
     }
 }
 

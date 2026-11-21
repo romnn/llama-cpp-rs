@@ -185,6 +185,18 @@ extern "C" {
     pub fn llama_rs_model_file_has_mtp_layers(path: *const ::std::os::raw::c_char) -> bool;
 }
 extern "C" {
+    pub fn llama_rs_ffn_exps_regex() -> *const ::std::os::raw::c_char;
+}
+extern "C" {
+    pub fn llama_rs_model_file_expert_bytes(
+        path: *const ::std::os::raw::c_char,
+        out_block_bytes: *mut u64,
+        capacity: usize,
+        out_block_count: *mut usize,
+        out_nextn_count: *mut u32,
+    ) -> llama_rs_status;
+}
+extern "C" {
     pub fn llama_rs_context_seq_rm_type(ctx: *mut llama_context) -> i32;
 }
 #[repr(C)]
